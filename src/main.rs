@@ -37,49 +37,182 @@ Notes:
   - mget and mput commands take y/n/q for yes/no/quit.
 ";
 
-const CMDS: &[(&str, &str)] = &[
-    ("!", "escape to the shell"),
-    ("?", "print local help information"),
-    ("append", "append to a file"),
-    ("ascii", "set ascii transfer type"),
-    ("bell", "beep when command completed"),
-    ("binary", "set binary transfer type"),
-    ("bye", "terminate ftp session and exit"),
-    ("cd", "change remote working directory"),
-    ("close", "terminate ftp session"),
-    ("delete", "delete remote file"),
-    ("debug", "toggle debugging mode"),
-    ("dir", "list contents of remote directory"),
-    ("disconnect", "terminate ftp session"),
-    ("get", "receive file"),
-    ("glob", "toggle metacharacter expansion of local file names"),
-    ("hash", "toggle printing `#' for each buffer transferred"),
-    ("help", "print local help information"),
-    ("lcd", "change local working directory"),
-    ("literal", "send arbitrary ftp command"),
-    ("ls", "nlist contents of remote directory"),
-    ("mdelete", "delete multiple files"),
-    ("mdir", "list contents of multiple remote directories"),
-    ("mget", "get multiple files"),
-    ("mkdir", "make directory on the remote machine"),
-    ("mls", "nlist contents of multiple remote directories"),
-    ("mput", "send multiple files"),
-    ("open", "connect to remote ftp"),
-    ("prompt", "force interactive prompting on multiple commands"),
-    ("put", "send one file"),
-    ("pwd", "print working directory on remote machine"),
-    ("quit", "terminate ftp session and exit"),
-    ("quote", "send arbitrary ftp command"),
-    ("recv", "receive file"),
-    ("remotehelp", "get help from remote server"),
-    ("rename", "rename file"),
-    ("rmdir", "remove directory on the remote machine"),
-    ("send", "send one file"),
-    ("status", "show current status"),
-    ("trace", "toggle packet tracing"),
-    ("type", "set file transfer type"),
-    ("user", "send new user information"),
-    ("verbose", "toggle verbose mode"),
+/// An interactive command: the name users type (or abbreviate) and its help text.
+#[derive(Debug, PartialEq)]
+struct CommandInfo {
+    name: &'static str,
+    help: &'static str,
+}
+
+const CMDS: &[CommandInfo] = &[
+    CommandInfo {
+        name: "!",
+        help: "escape to the shell",
+    },
+    CommandInfo {
+        name: "?",
+        help: "print local help information",
+    },
+    CommandInfo {
+        name: "append",
+        help: "append to a file",
+    },
+    CommandInfo {
+        name: "ascii",
+        help: "set ascii transfer type",
+    },
+    CommandInfo {
+        name: "bell",
+        help: "beep when command completed",
+    },
+    CommandInfo {
+        name: "binary",
+        help: "set binary transfer type",
+    },
+    CommandInfo {
+        name: "bye",
+        help: "terminate ftp session and exit",
+    },
+    CommandInfo {
+        name: "cd",
+        help: "change remote working directory",
+    },
+    CommandInfo {
+        name: "close",
+        help: "terminate ftp session",
+    },
+    CommandInfo {
+        name: "delete",
+        help: "delete remote file",
+    },
+    CommandInfo {
+        name: "debug",
+        help: "toggle debugging mode",
+    },
+    CommandInfo {
+        name: "dir",
+        help: "list contents of remote directory",
+    },
+    CommandInfo {
+        name: "disconnect",
+        help: "terminate ftp session",
+    },
+    CommandInfo {
+        name: "get",
+        help: "receive file",
+    },
+    CommandInfo {
+        name: "glob",
+        help: "toggle metacharacter expansion of local file names",
+    },
+    CommandInfo {
+        name: "hash",
+        help: "toggle printing `#' for each buffer transferred",
+    },
+    CommandInfo {
+        name: "help",
+        help: "print local help information",
+    },
+    CommandInfo {
+        name: "lcd",
+        help: "change local working directory",
+    },
+    CommandInfo {
+        name: "literal",
+        help: "send arbitrary ftp command",
+    },
+    CommandInfo {
+        name: "ls",
+        help: "nlist contents of remote directory",
+    },
+    CommandInfo {
+        name: "mdelete",
+        help: "delete multiple files",
+    },
+    CommandInfo {
+        name: "mdir",
+        help: "list contents of multiple remote directories",
+    },
+    CommandInfo {
+        name: "mget",
+        help: "get multiple files",
+    },
+    CommandInfo {
+        name: "mkdir",
+        help: "make directory on the remote machine",
+    },
+    CommandInfo {
+        name: "mls",
+        help: "nlist contents of multiple remote directories",
+    },
+    CommandInfo {
+        name: "mput",
+        help: "send multiple files",
+    },
+    CommandInfo {
+        name: "open",
+        help: "connect to remote ftp",
+    },
+    CommandInfo {
+        name: "prompt",
+        help: "force interactive prompting on multiple commands",
+    },
+    CommandInfo {
+        name: "put",
+        help: "send one file",
+    },
+    CommandInfo {
+        name: "pwd",
+        help: "print working directory on remote machine",
+    },
+    CommandInfo {
+        name: "quit",
+        help: "terminate ftp session and exit",
+    },
+    CommandInfo {
+        name: "quote",
+        help: "send arbitrary ftp command",
+    },
+    CommandInfo {
+        name: "recv",
+        help: "receive file",
+    },
+    CommandInfo {
+        name: "remotehelp",
+        help: "get help from remote server",
+    },
+    CommandInfo {
+        name: "rename",
+        help: "rename file",
+    },
+    CommandInfo {
+        name: "rmdir",
+        help: "remove directory on the remote machine",
+    },
+    CommandInfo {
+        name: "send",
+        help: "send one file",
+    },
+    CommandInfo {
+        name: "status",
+        help: "show current status",
+    },
+    CommandInfo {
+        name: "trace",
+        help: "toggle packet tracing",
+    },
+    CommandInfo {
+        name: "type",
+        help: "set file transfer type",
+    },
+    CommandInfo {
+        name: "user",
+        help: "send new user information",
+    },
+    CommandInfo {
+        name: "verbose",
+        help: "toggle verbose mode",
+    },
 ];
 
 const NEEDS_CONN: &[&str] = &[
@@ -133,6 +266,19 @@ struct Ftp {
 }
 
 type Sink<'a> = Box<dyn Write + 'a>;
+
+/// A complete server reply. `code` is 0 when the connection is gone.
+#[derive(Debug, PartialEq)]
+struct Reply {
+    code: u16,
+    text: String,
+}
+
+/// What the command line asks for besides the flags.
+struct CommandLine {
+    script: Option<String>,
+    host: Vec<String>,
+}
 
 /// Answer to an mget/mput/mdelete prompt.
 enum Answer {
@@ -226,11 +372,8 @@ impl Ftp {
         }
     }
 
-    /// Applies ftp.exe flags. Returns (script, host args), or None to show usage.
-    fn parse_args(
-        &mut self,
-        args: impl IntoIterator<Item = String>,
-    ) -> Option<(Option<String>, Vec<String>)> {
+    /// Applies ftp.exe flags. Returns None to show usage.
+    fn parse_args(&mut self, args: impl IntoIterator<Item = String>) -> Option<CommandLine> {
         let mut script = None;
         let mut host = Vec::new();
         for arg in args {
@@ -261,7 +404,7 @@ impl Ftp {
                 }
             }
         }
-        Some((script, host))
+        Some(CommandLine { script, host })
     }
 
     /// Runs one `ftp>` command line, e.g. `get a.txt`.
@@ -278,7 +421,7 @@ impl Ftp {
             return;
         }
         match lookup(&name) {
-            Ok(i) => self.run(CMDS[i].0, rest, split_args(rest)),
+            Ok(c) => self.run(c.name, rest, split_args(rest)),
             Err(e) => println!("{e}"),
         }
     }
@@ -350,23 +493,23 @@ impl Ftp {
         self.ctrl = None;
     }
 
-    fn reply(&mut self) -> (u16, String) {
+    fn reply(&mut self) -> Reply {
         let mut text = String::new();
         let mut code = 0;
         loop {
             let Some(r) = self.ctrl.as_mut() else {
-                return (0, text);
+                return Reply { code: 0, text };
             };
             let mut buf = Vec::new();
             match r.read_until(b'\n', &mut buf) {
                 Ok(1..) => {}
                 Ok(0) => {
                     self.lost("Connection closed by remote host.");
-                    return (0, text);
+                    return Reply { code: 0, text };
                 }
                 Err(e) => {
                     self.lost(&format!("> ftp: {e}"));
-                    return (0, text);
+                    return Reply { code: 0, text };
                 }
             }
             let line = String::from_utf8_lossy(&buf);
@@ -388,15 +531,18 @@ impl Ftp {
             text += line;
             text.push('\n');
             if done {
-                return (code, text);
+                return Reply { code, text };
             }
         }
     }
 
-    fn cmd(&mut self, line: &str) -> (u16, String) {
+    fn cmd(&mut self, line: &str) -> Reply {
         let Some(r) = self.ctrl.as_mut() else {
             println!("Not connected.");
-            return (0, String::new());
+            return Reply {
+                code: 0,
+                text: String::new(),
+            };
         };
         if self.debug {
             println!(
@@ -413,13 +559,16 @@ impl Ftp {
             .is_err()
         {
             self.lost("Connection closed by remote host.");
-            return (0, String::new());
+            return Reply {
+                code: 0,
+                text: String::new(),
+            };
         }
         self.reply()
     }
 
     fn code(&mut self, line: &str) -> u16 {
-        self.cmd(line).0
+        self.cmd(line).code
     }
 
     fn open(&mut self, mut a: Vec<String>) {
@@ -453,7 +602,7 @@ impl Ftp {
         self.ctrl = Some(BufReader::new(s));
         self.host = host;
         self.binary = false;
-        if self.reply().0 / 100 != 2 {
+        if self.reply().code / 100 != 2 {
             self.ctrl = None;
             return;
         }
@@ -524,8 +673,8 @@ impl Ftp {
         let s = self.ctrl.as_ref()?.get_ref();
         let (local, peer) = (s.local_addr().ok()?, s.peer_addr().ok()?);
         if self.passive {
-            let (code, text) = self.cmd(if peer.is_ipv4() { "PASV" } else { "EPSV" });
-            let port = pasv_port(code, &text)?;
+            let reply = self.cmd(if peer.is_ipv4() { "PASV" } else { "EPSV" });
+            let port = pasv_port(reply.code, &reply.text)?;
             // The address in a PASV reply is ignored (NAT-safe, like curl): always use the control peer.
             return match TcpStream::connect((peer.ip(), port)) {
                 Ok(d) => Some(Data::Conn(d)),
@@ -602,7 +751,7 @@ impl Ftp {
         if let Err(e) = &res {
             println!("> ftp: {e}");
         }
-        let ok = self.reply().0 / 100 == 2;
+        let ok = self.reply().code / 100 == 2;
         if let Ok(n) = res
             && ok
             && n > 0
@@ -733,7 +882,7 @@ impl Ftp {
         }
         match name {
             "!" => shell(rest),
-            "?" | "help" => help(a.first()),
+            "?" | "help" => help(a.first().map(String::as_str)),
             "append" | "put" | "send" => {
                 if self.need(&mut a, 1, &["Local file ", "Remote file "]) {
                     let verb = if name == "append" { "APPE" } else { "STOR" };
@@ -794,7 +943,7 @@ impl Ftp {
                 if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
                     let mut code = self.code(&line);
                     while code / 100 == 1 {
-                        code = self.reply().0;
+                        code = self.reply().code;
                     }
                 }
             }
@@ -997,25 +1146,22 @@ fn split_args(s: &str) -> Vec<String> {
     v
 }
 
-fn lookup(name: &str) -> Result<usize, &'static str> {
-    if let Some(i) = CMDS.iter().position(|c| c.0 == name) {
-        return Ok(i);
+fn lookup(name: &str) -> Result<&'static CommandInfo, &'static str> {
+    if let Some(c) = CMDS.iter().find(|c| c.name == name) {
+        return Ok(c);
     }
-    let mut hits = CMDS
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.0.starts_with(name));
+    let mut hits = CMDS.iter().filter(|c| c.name.starts_with(name));
     match (hits.next(), hits.next()) {
-        (Some((i, _)), None) => Ok(i),
+        (Some(c), None) => Ok(c),
         (Some(_), Some(_)) => Err("Ambiguous command."),
         _ => Err("Invalid command."),
     }
 }
 
-fn help(arg: Option<&String>) {
+fn help(arg: Option<&str>) {
     if let Some(c) = arg {
         match lookup(&c.to_lowercase()) {
-            Ok(i) => println!("{:<16}{}", CMDS[i].0, CMDS[i].1),
+            Ok(c) => println!("{:<16}{}", c.name, c.help),
             Err(_) => println!("Invalid help command {c}."),
         }
         return;
@@ -1023,9 +1169,11 @@ fn help(arg: Option<&String>) {
     println!("Commands may be abbreviated.  Commands are:\n");
     let rows = CMDS.len().div_ceil(5);
     for r in 0..rows {
-        let line: String = (r..CMDS.len())
+        let line: String = CMDS
+            .iter()
+            .skip(r)
             .step_by(rows)
-            .map(|i| format!("{:<16}", CMDS[i].0))
+            .map(|c| format!("{:<16}", c.name))
             .collect();
         println!("{}", line.trim_end());
     }
@@ -1121,7 +1269,7 @@ fn legacy(b: &[u8]) -> String {
 
 fn main() {
     let mut f = Ftp::new(Box::new(io::stdin().lock()), io::stdin().is_terminal());
-    let Some((script, host)) = f.parse_args(env::args().skip(1)) else {
+    let Some(CommandLine { script, host }) = f.parse_args(env::args().skip(1)) else {
         print!("{USAGE}");
         return;
     };
@@ -1176,8 +1324,8 @@ mod tests {
         );
         assert_eq!(split_args(r#"a "" b"#), ["a", "", "b"]);
 
-        assert_eq!(lookup("bi").map(|i| CMDS[i].0), Ok("binary"));
-        assert_eq!(lookup("dir").map(|i| CMDS[i].0), Ok("dir"));
+        assert_eq!(lookup("bi").map(|c| c.name), Ok("binary"));
+        assert_eq!(lookup("dir").map(|c| c.name), Ok("dir"));
         assert_eq!(lookup("d"), Err("Ambiguous command."));
         assert_eq!(lookup("xyz"), Err("Invalid command."));
     }
@@ -1201,7 +1349,7 @@ mod tests {
     fn flags() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut f = Ftp::new(Box::new(io::empty()), false);
-        let (script, host) = f
+        let CommandLine { script, host } = f
             .parse_args(args(&[
                 "-inv",
                 "-p",
@@ -1331,8 +1479,12 @@ mod tests {
             b"junk line\r\n\r\n220 ready\r\n230-multi\r\n 230 not the end\r\n230\r\n331 next\r\n",
         )
         .unwrap();
-        assert_eq!(f.reply(), (220, "220 ready\n".into()));
-        assert_eq!(f.reply().0, 230);
-        assert_eq!(f.reply().0, 331);
+        let ready = Reply {
+            code: 220,
+            text: "220 ready\n".into(),
+        };
+        assert_eq!(f.reply(), ready);
+        assert_eq!(f.reply().code, 230);
+        assert_eq!(f.reply().code, 331);
     }
 }
