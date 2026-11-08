@@ -4,7 +4,8 @@ use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "
 Transfers files to and from a computer running an FTP server service
@@ -105,6 +106,7 @@ struct Ftp {
     anon: bool,
     binary: bool,
     bufsize: usize,
+    timeout: Duration,
 }
 
 enum Data {
@@ -113,11 +115,30 @@ enum Data {
 }
 
 impl Data {
-    fn open(self) -> io::Result<TcpStream> {
-        match self {
-            Data::Listen(l) => l.accept().map(|(s, _)| s),
-            Data::Conn(s) => Ok(s),
-        }
+    /// Waits at most `t` for the server's data connection; reads and writes then time out after `t`.
+    fn open(self, t: Duration) -> io::Result<TcpStream> {
+        let s = match self {
+            Data::Conn(s) => s,
+            Data::Listen(l) => {
+                // ponytail: polls accept() every 5 ms (std has no accept timeout); WSAPoll would avoid the wakeups.
+                l.set_nonblocking(true)?;
+                let end = Instant::now() + t;
+                loop {
+                    match l.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+                        Err(_) if Instant::now() >= end => {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "no data connection from server"));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            }
+        };
+        s.set_nonblocking(false)?; // accepted sockets inherit non-blocking mode on Windows
+        s.set_read_timeout(Some(t))?;
+        s.set_write_timeout(Some(t))?;
+        Ok(s)
     }
 }
 
@@ -141,6 +162,7 @@ impl Ftp {
             anon: false,
             binary: false,
             bufsize: 65536,
+            timeout: Duration::from_secs(60),
         }
     }
 
@@ -247,8 +269,8 @@ impl Ftp {
         }
     }
 
-    fn lost(&mut self) {
-        println!("Connection closed by remote host.");
+    fn lost(&mut self, why: &str) {
+        println!("{why}");
         self.ctrl = None;
     }
 
@@ -258,9 +280,16 @@ impl Ftp {
         loop {
             let Some(r) = self.ctrl.as_mut() else { return (0, text) };
             let mut buf = Vec::new();
-            if !matches!(r.read_until(b'\n', &mut buf), Ok(1..)) {
-                self.lost();
-                return (0, text);
+            match r.read_until(b'\n', &mut buf) {
+                Ok(1..) => {}
+                Ok(0) => {
+                    self.lost("Connection closed by remote host.");
+                    return (0, text);
+                }
+                Err(e) => {
+                    self.lost(&format!("> ftp: {e}"));
+                    return (0, text);
+                }
             }
             let line = String::from_utf8_lossy(&buf);
             let line = line.trim_end_matches(['\r', '\n']);
@@ -295,7 +324,7 @@ impl Ftp {
             println!("---> {}", if line.starts_with("PASS ") { "PASS XXXX" } else { line });
         }
         if r.get_mut().write_all(format!("{line}\r\n").as_bytes()).is_err() {
-            self.lost();
+            self.lost("Connection closed by remote host.");
             return (0, String::new());
         }
         self.reply()
@@ -330,6 +359,8 @@ impl Ftp {
             }
         };
         s.set_nodelay(true).ok();
+        s.set_read_timeout(Some(self.timeout)).ok();
+        s.set_write_timeout(Some(self.timeout)).ok();
         println!("Connected to {host}.");
         self.ctrl = Some(BufReader::new(s));
         self.host = host;
@@ -496,7 +527,7 @@ impl Ftp {
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data.open().and_then(|mut s| self.copy(&mut s, out, ascii));
+        let res = data.open(self.timeout).and_then(|mut s| self.copy(&mut s, out, ascii));
         self.finish(res, start, "received")
     }
 
@@ -534,7 +565,7 @@ impl Ftp {
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data.open().and_then(|mut s| self.copy(&mut f, &mut s, ascii));
+        let res = data.open(self.timeout).and_then(|mut s| self.copy(&mut f, &mut s, ascii));
         self.finish(res, start, "sent");
     }
 
@@ -970,6 +1001,61 @@ mod tests {
         let mut f = Ftp::new(Box::new(io::Cursor::new(input.to_string())), false);
         f.ctrl = Some(BufReader::new(c));
         (f, l.accept().unwrap().0)
+    }
+
+    /// Minimal FTP server: passive data, `files` as (name, content).
+    /// `RETR hang` answers 150 then 425 and never connects (a firewalled active-mode transfer).
+    fn fake(s: TcpStream, files: Vec<(&'static str, &'static str)>) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut r = BufReader::new(s);
+            let mut data = None;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = line.trim_end();
+                let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
+                let reply = match cmd {
+                    "PASV" => {
+                        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                        let p = l.local_addr().unwrap().port();
+                        data = Some(l);
+                        format!("227 ok (127,0,0,1,{},{})", p >> 8, p & 255)
+                    }
+                    "RETR" if arg == "hang" => "150 ok\r\n425 no connection".into(),
+                    "RETR" | "NLST" => match files.iter().find(|f| f.0 == arg) {
+                        Some((_, body)) => {
+                            r.get_mut().write_all(b"150 ok\r\n").unwrap();
+                            let (mut d, _) = data.take().unwrap().accept().unwrap();
+                            d.write_all(body.as_bytes()).unwrap();
+                            "226 done".into()
+                        }
+                        None => "550 not found".into(),
+                    },
+                    _ => "200 ok".into(),
+                };
+                r.get_mut().write_all(format!("{reply}\r\n").as_bytes()).unwrap();
+            }
+        })
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = env::temp_dir().join(format!("ftp-test-{name}-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn active_mode_gives_up_when_server_never_connects() {
+        let (mut f, s) = connected("");
+        let srv = fake(s, vec![]);
+        f.timeout = Duration::from_millis(500);
+        let local = tmpdir("hang").join("x");
+        f.get("RETR hang".into(), local.to_str().unwrap()); // used to block in accept() forever
+        assert!(!local.exists());
+        drop(f);
+        srv.join().unwrap();
     }
 
     #[test]
