@@ -290,7 +290,7 @@ impl Ftp {
         if !matches!(n, Ok(1..)) {
             return None;
         }
-        let line = String::from_utf8_lossy(&buf);
+        let line = String::from_utf8(buf).unwrap_or_else(|e| legacy(e.as_bytes()));
         let line = line
             .trim_start_matches('\u{feff}')
             .trim_end_matches(['\r', '\n']);
@@ -1053,6 +1053,44 @@ fn console_echo(on: bool) {
 #[cfg(not(windows))]
 fn console_echo(_on: bool) {}
 
+/// Decodes a non-UTF-8 script line with the OEM code page,
+/// which is what `echo ... >> script.txt` in cmd.exe writes.
+#[cfg(windows)]
+fn legacy(b: &[u8]) -> String {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            cp: u32,
+            flags: u32,
+            s: *const u8,
+            n: i32,
+            w: *mut u16,
+            wn: i32,
+        ) -> i32;
+    }
+    const CP_OEMCP: u32 = 1;
+    let mut w = vec![0u16; b.len()]; // code pages never yield more UTF-16 units than bytes
+    let n = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            b.as_ptr(),
+            b.len() as i32,
+            w.as_mut_ptr(),
+            w.len() as i32,
+        )
+    };
+    if n <= 0 {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    String::from_utf16_lossy(&w[..n as usize])
+}
+
+#[cfg(not(windows))]
+fn legacy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
 fn main() {
     let mut f = Ftp::new(Box::new(io::stdin().lock()), io::stdin().is_terminal());
     let Some((script, host)) = f.parse_args(env::args().skip(1)) else {
@@ -1120,6 +1158,16 @@ mod tests {
     #[test]
     fn console_accepts_invalid_utf8() {
         assert_eq!(Console.write(b"B\xfccher\n").unwrap(), 7);
+    }
+
+    #[test]
+    fn script_lines() {
+        let script = b"\xef\xbb\xbfopen h\r\nput B\xfccher.txt\r\nbye";
+        let mut f = Ftp::new(Box::new(io::Cursor::new(script.to_vec())), false);
+        assert_eq!(f.ask("", false).as_deref(), Some("open h")); // BOM and CRLF stripped
+        assert!(f.ask("", false).unwrap().starts_with("put B")); // non-UTF-8 doesn't end the script
+        assert_eq!(f.ask("", false).as_deref(), Some("bye")); // last line without newline
+        assert_eq!(f.ask("", false), None);
     }
 
     #[test]
