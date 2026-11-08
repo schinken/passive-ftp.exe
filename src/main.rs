@@ -4,6 +4,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1133,23 +1134,14 @@ fn help(arg: Option<&str>) {
 
 fn shell(line: &str) {
     let line = line.trim();
-    #[cfg(windows)]
     let mut command = Command::new(env::var("COMSPEC").unwrap_or("cmd.exe".into()));
-    #[cfg(windows)]
     if !line.is_empty() {
-        use std::os::windows::process::CommandExt;
+        // raw_arg: cmd.exe parses its command line itself, so pass it through as typed.
         command.raw_arg(format!("/C {line}"));
-    }
-    #[cfg(not(windows))]
-    let mut command = Command::new("sh");
-    #[cfg(not(windows))]
-    if !line.is_empty() {
-        command.args(["-c", line]);
     }
     command.status().ok();
 }
 
-#[cfg(windows)]
 fn set_console_echo(on: bool) {
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1176,12 +1168,8 @@ fn set_console_echo(on: bool) {
     }
 }
 
-#[cfg(not(windows))]
-fn set_console_echo(_on: bool) {}
-
 /// Decodes a non-UTF-8 script line with the OEM code page,
 /// which is what `echo ... >> script.txt` in cmd.exe writes.
-#[cfg(windows)]
 fn decode_oem(bytes: &[u8]) -> String {
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1212,11 +1200,6 @@ fn decode_oem(bytes: &[u8]) -> String {
         return String::from_utf8_lossy(bytes).into_owned();
     }
     String::from_utf16_lossy(&wide[..len as usize])
-}
-
-#[cfg(not(windows))]
-fn decode_oem(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn main() {
@@ -1401,7 +1384,11 @@ mod tests {
         let (mut f, s) = connected("");
         let files = vec![
             ("a", "new"),
-            ("*", "../evil.txt\r\n/abs.txt\r\nsub/ok.txt\r\n"),
+            (
+                "*",
+                "../evil.txt\r\n/abs.txt\r\nC:\\evil\\drive.txt\r\nsub/ok.txt\r\n",
+            ),
+            ("C:\\evil\\drive.txt", "drive"),
             ("../evil.txt", "evil"),
             ("/abs.txt", "abs"),
             ("sub/ok.txt", "ok"),
@@ -1425,6 +1412,7 @@ mod tests {
         f.exec("mget *");
         assert_eq!(fs::read_to_string(work.join("evil.txt")).unwrap(), "evil");
         assert_eq!(fs::read_to_string(work.join("abs.txt")).unwrap(), "abs");
+        assert_eq!(fs::read_to_string(work.join("drive.txt")).unwrap(), "drive");
         assert_eq!(fs::read_to_string(work.join("sub/ok.txt")).unwrap(), "ok"); // Kept, like ftp.exe.
         assert!(!dir.join("evil.txt").exists()); // server names can't escape the cwd
         drop(f);
