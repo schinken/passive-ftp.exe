@@ -1,3 +1,5 @@
+//! Drop-in replacement for Windows `ftp.exe` that adds passive mode (`-p`).
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
@@ -168,7 +170,7 @@ impl Data {
         let s = match self {
             Data::Conn(s) => s,
             Data::Listen(l) => {
-                // ponytail: polls accept() every 5 ms (std has no accept timeout); WSAPoll would avoid the wakeups.
+                // ponytail: polls accept() every 5 ms (std has no accept timeout). WSAPoll would avoid the wakeups.
                 l.set_nonblocking(true)?;
                 let end = Instant::now() + t;
                 loop {
@@ -186,7 +188,7 @@ impl Data {
                 }
             }
         };
-        s.set_nonblocking(false)?; // accepted sockets inherit non-blocking mode on Windows
+        s.set_nonblocking(false)?; // Accepted sockets inherit non-blocking mode on Windows.
         s.set_read_timeout(Some(t))?;
         s.set_write_timeout(Some(t))?;
         Ok(s)
@@ -255,7 +257,7 @@ impl Ftp {
         Some((script, host))
     }
 
-    /// Runs one command line.
+    /// Runs one `ftp>` command line, e.g. `get a.txt`.
     fn exec(&mut self, line: &str) {
         let line = line.trim();
         let (name, rest) = match line.strip_prefix('!') {
@@ -352,7 +354,7 @@ impl Ftp {
             let line = String::from_utf8_lossy(&buf);
             let line = line.trim_end_matches(['\r', '\n']);
             let done = match (code, reply_start(line)) {
-                (0, None) => false, // stray line before a reply: show it, keep waiting
+                (0, None) => false, // Stray line before a reply: show it, keep waiting.
                 (0, Some((c, more))) => {
                     code = c;
                     !more
@@ -917,7 +919,7 @@ fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
         227 => {
             let t = text.get(3..)?;
-            let t = t.find('(').map_or(t, |i| &t[i..]); // skip digits in the text before "("
+            let t = t.find('(').map_or(t, |i| &t[i..]); // Skip digits in the text before "(".
             let n: Vec<u16> = t
                 .split(|c: char| !c.is_ascii_digit())
                 .filter_map(|x| x.parse().ok())
@@ -1037,6 +1039,7 @@ fn console_echo(on: bool) {
     }
     const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const ENABLE_ECHO_INPUT: u32 = 4;
+    // SAFETY: plain Win32 calls with a handle we just got and a valid pointer to a local u32.
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode = 0;
@@ -1072,7 +1075,9 @@ fn legacy(b: &[u8]) -> String {
         ) -> i32;
     }
     const CP_OEMCP: u32 = 1;
-    let mut w = vec![0u16; b.len()]; // code pages never yield more UTF-16 units than bytes
+    let mut w = vec![0u16; b.len()];
+    // SAFETY: both pointers are valid for the lengths passed, and a code page never yields
+    // more UTF-16 units than input bytes, so `w` is large enough.
     let n = unsafe {
         MultiByteToWideChar(
             CP_OEMCP,
