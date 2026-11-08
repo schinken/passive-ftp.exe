@@ -1260,8 +1260,8 @@ mod tests {
         let (mut cr, mut out) = (false, Vec::new());
         to_crlf(b"a\nb\r", &mut cr, &mut out);
         assert_eq!(out, b"a\r\nb\r");
-        to_crlf(b"\nc\n", &mut cr, &mut out); // CRLF split across chunks stays CRLF
-        assert_eq!(out, b"\nc\r\n");
+        to_crlf(b"\nc\n", &mut cr, &mut out);
+        assert_eq!(out, b"\nc\r\n", "a CRLF split across two chunks stays CRLF");
 
         assert!(
             wildcard_match(b"*.TXT", b"a.txt")
@@ -1290,9 +1290,18 @@ mod tests {
     fn script_lines() {
         let script = b"\xef\xbb\xbfopen h\r\nput B\xfccher.txt\r\nbye";
         let mut f = Ftp::new(Box::new(io::Cursor::new(script.to_vec())), false);
-        assert_eq!(f.ask("").as_deref(), Some("open h")); // BOM and CRLF stripped
-        assert!(f.ask("").unwrap().starts_with("put B")); // non-UTF-8 doesn't end the script
-        assert_eq!(f.ask("").as_deref(), Some("bye")); // last line without newline
+        assert_eq!(
+            f.ask("").as_deref(),
+            Some("open h"),
+            "BOM and CRLF are stripped"
+        );
+        let line = f.ask("").expect("a non-UTF-8 line must not end the script");
+        assert!(line.starts_with("put B"), "got {line:?}");
+        assert_eq!(
+            f.ask("").as_deref(),
+            Some("bye"),
+            "last line without newline"
+        );
         assert_eq!(f.ask(""), None);
     }
 
@@ -1413,18 +1422,29 @@ mod tests {
         fs::write(work.join("x.part"), "mine").unwrap();
 
         f.get("RETR missing".into(), x.to_str().unwrap());
-        assert_eq!(fs::read_to_string(&x).unwrap(), "keep"); // 550: local file untouched
+        let after_550 = fs::read_to_string(&x).unwrap();
+        assert_eq!(
+            after_550, "keep",
+            "a failed get must not touch the local file"
+        );
         f.get("RETR a".into(), x.to_str().unwrap());
         assert_eq!(fs::read_to_string(&x).unwrap(), "new");
         assert_eq!(fs::read_to_string(work.join("x.part")).unwrap(), "mine");
 
-        env::set_current_dir(&work).unwrap(); // only this test depends on the cwd
+        env::set_current_dir(&work).unwrap(); // Only this test depends on the cwd.
         f.exec("mget *");
         assert_eq!(fs::read_to_string(work.join("evil.txt")).unwrap(), "evil");
         assert_eq!(fs::read_to_string(work.join("abs.txt")).unwrap(), "abs");
         assert_eq!(fs::read_to_string(work.join("drive.txt")).unwrap(), "drive");
-        assert_eq!(fs::read_to_string(work.join("sub/ok.txt")).unwrap(), "ok"); // Kept, like ftp.exe.
-        assert!(!dir.join("evil.txt").exists()); // server names can't escape the cwd
+        let kept = fs::read_to_string(work.join("sub/ok.txt")).unwrap();
+        assert_eq!(
+            kept, "ok",
+            "names inside the cwd keep their directory, like ftp.exe"
+        );
+        assert!(
+            !dir.join("evil.txt").exists(),
+            "server names must not escape the cwd"
+        );
         drop(f);
         srv.join().unwrap();
     }
