@@ -264,20 +264,22 @@ impl Ftp {
             }
             let line = String::from_utf8_lossy(&buf);
             let line = line.trim_end_matches(['\r', '\n']);
-            let first = code == 0;
-            if first {
-                code = line.get(..3).and_then(|c| c.parse().ok()).unwrap_or(0);
-            }
+            let done = match (code, reply_start(line)) {
+                (0, None) => false, // stray line before a reply: show it, keep waiting
+                (0, Some((c, more))) => {
+                    code = c;
+                    !more
+                }
+                (c, _) => line.starts_with(&format!("{c} ")) || line == c.to_string(),
+            };
             if self.verbose || code >= 500 {
                 println!("{line}");
             }
+            if code == 0 {
+                continue;
+            }
             text += line;
             text.push('\n');
-            let done = if first {
-                line.as_bytes().get(3) != Some(&b'-')
-            } else {
-                line.starts_with(&format!("{code} "))
-            };
             if done {
                 return (code, text);
             }
@@ -765,6 +767,16 @@ fn toggle(flag: &mut bool, what: &str) {
     println!("{what} {} .", on(*flag));
 }
 
+/// Code and "more lines follow" flag if `line` starts a reply (`123 text` / `123-text`).
+fn reply_start(line: &str) -> Option<(u16, bool)> {
+    let code = line.get(..3).filter(|c| c.bytes().all(|b| b.is_ascii_digit()))?.parse().ok()?;
+    match line.as_bytes().get(3) {
+        None | Some(b' ') => Some((code, false)),
+        Some(b'-') => Some((code, true)),
+        _ => None,
+    }
+}
+
 /// Port from a 227 (PASV) or 229 (EPSV) reply.
 fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
@@ -949,5 +961,23 @@ mod tests {
         assert_eq!((script.as_deref(), host), (Some("x y.txt"), args(&["host", "21"])));
         assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.bufsize == 10);
         assert!(Ftp::new(Box::new(io::empty()), false).parse_args(args(&["-?"])).is_none());
+    }
+
+    /// Ftp wired to a local socket; returns the server end. `input` feeds prompts.
+    fn connected(input: &str) -> (Ftp, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut f = Ftp::new(Box::new(io::Cursor::new(input.to_string())), false);
+        f.ctrl = Some(BufReader::new(c));
+        (f, l.accept().unwrap().0)
+    }
+
+    #[test]
+    fn replies() {
+        let (mut f, mut s) = connected("");
+        s.write_all(b"junk line\r\n\r\n220 ready\r\n230-multi\r\n 230 not the end\r\n230\r\n331 next\r\n").unwrap();
+        assert_eq!(f.reply(), (220, "220 ready\n".into()));
+        assert_eq!(f.reply().0, 230);
+        assert_eq!(f.reply().0, 331);
     }
 }
