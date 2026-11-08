@@ -134,6 +134,13 @@ struct Ftp {
 
 type Sink<'a> = Box<dyn Write + 'a>;
 
+/// Answer to an mget/mput/mdelete prompt.
+enum Answer {
+    Yes,
+    No,
+    Quit,
+}
+
 /// Console output that replaces invalid UTF-8: Windows consoles reject such bytes,
 /// which a listing with Latin-1 file names would otherwise trigger.
 // ponytail: a multi-byte character split across two reads prints as two U+FFFD.
@@ -277,17 +284,26 @@ impl Ftp {
     }
 
     /// Reads one line from the command source (console or -s script).
-    fn ask(&mut self, prompt: &str, secret: bool) -> Option<String> {
+    fn ask(&mut self, prompt: &str) -> Option<String> {
+        self.read_input(prompt, /* secret= */ false)
+    }
+
+    /// Like `ask`, but hides the typed text (passwords).
+    fn ask_secret(&mut self, prompt: &str) -> Option<String> {
+        self.read_input(prompt, /* secret= */ true)
+    }
+
+    fn read_input(&mut self, prompt: &str, secret: bool) -> Option<String> {
         print!("{prompt}");
         io::stdout().flush().ok();
         let hide = secret && self.tty;
         if hide {
-            console_echo(false);
+            set_console_echo(false);
         }
         let mut buf = Vec::new();
         let n = self.input.read_until(b'\n', &mut buf);
         if hide {
-            console_echo(true);
+            set_console_echo(true);
         }
         if !matches!(n, Ok(1..)) {
             return None;
@@ -307,7 +323,7 @@ impl Ftp {
     fn need(&mut self, a: &mut Vec<String>, need: usize, prompts: &[&str]) -> bool {
         let want = if a.is_empty() { prompts.len() } else { need };
         while a.len() < want {
-            match self.ask(prompts[a.len()], false) {
+            match self.ask(prompts[a.len()]) {
                 Some(s) if !s.trim().is_empty() => a.push(s.trim().trim_matches('"').to_string()),
                 _ => break,
             }
@@ -315,15 +331,17 @@ impl Ftp {
         a.len() >= need
     }
 
-    fn confirm(&mut self, what: &str, name: &str) -> Option<bool> {
+    fn confirm(&mut self, what: &str, name: &str) -> Answer {
         if !self.prompt {
-            return Some(true);
+            return Answer::Yes;
         }
-        let a = self.ask(&format!("{what} {name}? "), false)?;
-        match a.trim_start().chars().next() {
-            Some('n' | 'N') => Some(false),
-            Some('q' | 'Q') => None,
-            _ => Some(true),
+        let Some(answer) = self.ask(&format!("{what} {name}? ")) else {
+            return Answer::Quit;
+        };
+        match answer.trim_start().chars().next() {
+            Some('n' | 'N') => Answer::No,
+            Some('q' | 'Q') => Answer::Quit,
+            _ => Answer::Yes,
         }
     }
 
@@ -453,7 +471,7 @@ impl Ftp {
                 a = vec!["anonymous".into(), format!("{me}@{host}")];
             } else {
                 let p = format!("User ({}:(none)): ", self.host);
-                let Some(u) = self.ask(&p, false) else { return };
+                let Some(u) = self.ask(&p) else { return };
                 a.push(u);
             }
         }
@@ -461,7 +479,7 @@ impl Ftp {
         if code == 331 {
             let pass = match a.get(1) {
                 Some(p) => p.clone(),
-                None => match self.ask("Password:", true) {
+                None => match self.ask_secret("Password:") {
                     Some(p) => p,
                     None => return,
                 },
@@ -471,7 +489,7 @@ impl Ftp {
         if code == 332 {
             let acct = match a.get(2) {
                 Some(p) => p.clone(),
-                None => match self.ask("Account:", false) {
+                None => match self.ask("Account:") {
                     Some(p) => p,
                     None => return,
                 },
@@ -495,7 +513,7 @@ impl Ftp {
         std::process::exit(0)
     }
 
-    fn set_type(&mut self, binary: bool) {
+    fn set_binary(&mut self, binary: bool) {
         if self.code(if binary { "TYPE I" } else { "TYPE A" }) / 100 == 2 {
             self.binary = binary;
         }
@@ -722,8 +740,8 @@ impl Ftp {
                     self.put(verb, &a[0], a.get(1).unwrap_or(&a[0]));
                 }
             }
-            "ascii" => self.set_type(false),
-            "binary" => self.set_type(true),
+            "ascii" => self.set_binary(false),
+            "binary" => self.set_binary(true),
             "bell" => toggle(&mut self.bell, "Bell mode"),
             "bye" | "quit" => self.quit(),
             "cd" => {
@@ -769,7 +787,7 @@ impl Ftp {
             }
             "literal" | "quote" => {
                 let line = if rest.is_empty() {
-                    self.ask("Command line to send ", false)
+                    self.ask("Command line to send ")
                 } else {
                     Some(rest.into())
                 };
@@ -787,7 +805,7 @@ impl Ftp {
                 for pat in &a {
                     for f in self.remote_glob(pat) {
                         match self.confirm(name, &f) {
-                            Some(true) if name == "mget" => {
+                            Answer::Yes if name == "mget" => {
                                 // Names come from the server: keep only the file name so a
                                 // listing like `../x` or `C:\x` can't write outside the cwd.
                                 if let Some(n) = Path::new(&f).file_name().and_then(|n| n.to_str())
@@ -795,9 +813,9 @@ impl Ftp {
                                     self.get(format!("RETR {f}"), n);
                                 }
                             }
-                            Some(true) => _ = self.code(&format!("DELE {f}")),
-                            Some(false) => {}
-                            None => return,
+                            Answer::Yes => _ = self.code(&format!("DELE {f}")),
+                            Answer::No => {}
+                            Answer::Quit => return,
                         }
                     }
                 }
@@ -807,7 +825,9 @@ impl Ftp {
                     return;
                 }
                 let local = a.pop().unwrap_or_default();
-                if local != "-" && self.confirm("output to local-file:", &local) != Some(true) {
+                if local != "-"
+                    && !matches!(self.confirm("output to local-file:", &local), Answer::Yes)
+                {
                     return;
                 }
                 let mut out: Sink = if local == "-" {
@@ -838,9 +858,9 @@ impl Ftp {
                 for pat in &a {
                     for f in self.local_glob(pat) {
                         match self.confirm(name, &f) {
-                            Some(true) => self.put("STOR", &f, &f),
-                            Some(false) => {}
-                            None => return,
+                            Answer::Yes => self.put("STOR", &f, &f),
+                            Answer::No => {}
+                            Answer::Quit => return,
                         }
                     }
                 }
@@ -876,8 +896,8 @@ impl Ftp {
                     "Using {} mode to transfer files.",
                     if self.binary { "binary" } else { "ascii" }
                 ),
-                Some("ascii") => self.set_type(false),
-                Some("binary" | "image") => self.set_type(true),
+                Some("ascii") => self.set_binary(false),
+                Some("binary" | "image") => self.set_binary(true),
                 Some(m) => println!("{m}: unknown mode."),
             },
             "user" => {
@@ -1030,7 +1050,7 @@ fn shell(line: &str) {
 }
 
 #[cfg(windows)]
-fn console_echo(on: bool) {
+fn set_console_echo(on: bool) {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetStdHandle(id: u32) -> isize;
@@ -1057,7 +1077,7 @@ fn console_echo(on: bool) {
 }
 
 #[cfg(not(windows))]
-fn console_echo(_on: bool) {}
+fn set_console_echo(_on: bool) {}
 
 /// Decodes a non-UTF-8 script line with the OEM code page,
 /// which is what `echo ... >> script.txt` in cmd.exe writes.
@@ -1117,9 +1137,7 @@ fn main() {
         f.open(host);
     }
     loop {
-        let Some(line) = f.ask("ftp> ", false) else {
-            f.quit()
-        };
+        let Some(line) = f.ask("ftp> ") else { f.quit() };
         f.exec(&line);
     }
 }
@@ -1173,10 +1191,10 @@ mod tests {
     fn script_lines() {
         let script = b"\xef\xbb\xbfopen h\r\nput B\xfccher.txt\r\nbye";
         let mut f = Ftp::new(Box::new(io::Cursor::new(script.to_vec())), false);
-        assert_eq!(f.ask("", false).as_deref(), Some("open h")); // BOM and CRLF stripped
-        assert!(f.ask("", false).unwrap().starts_with("put B")); // non-UTF-8 doesn't end the script
-        assert_eq!(f.ask("", false).as_deref(), Some("bye")); // last line without newline
-        assert_eq!(f.ask("", false), None);
+        assert_eq!(f.ask("").as_deref(), Some("open h")); // BOM and CRLF stripped
+        assert!(f.ask("").unwrap().starts_with("put B")); // non-UTF-8 doesn't end the script
+        assert_eq!(f.ask("").as_deref(), Some("bye")); // last line without newline
+        assert_eq!(f.ask(""), None);
     }
 
     #[test]
