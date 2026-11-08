@@ -4,7 +4,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -24,15 +24,16 @@ FTP [-v] [-d] [-i] [-n] [-g] [-s:filename] [-a] [-A] [-x:sendbuffer] [-r:recvbuf
                   commands will automatically run after FTP starts.
   -a              Use any local interface when binding data connection.
   -A              login as anonymous.
-  -x:send sockbuf Accepted for compatibility, ignored.
-  -r:recv sockbuf Accepted for compatibility, ignored.
-  -b:async count  Accepted for compatibility, ignored.
-  -w:windowsize   Overrides the default transfer buffer size of 65536.
+  -x:send sockbuf Overrides the default SO_SNDBUF size of 8192.
+  -r:recv sockbuf Overrides the default SO_RCVBUF size of 8192.
+  -b:async count  Overrides the default async count of 3
+  -w:windowsize   Overrides the default transfer buffer size of 65535.
   host            Specifies the host name or IP address of the remote
                   host to connect to.
 
 Notes:
   - mget and mput commands take y/n/q for yes/no/quit.
+  - Use Control-C to abort commands.
 ";
 
 /// An interactive command: the name users type (or abbreviate) and its help text.
@@ -325,8 +326,8 @@ impl Ftp {
             autologin: true,
             anonymous: false,
             binary: false,
-            buffer_size: 65536,
-            timeout: Duration::from_secs(60),
+            buffer_size: 65535,
+            timeout: Duration::from_secs(15 * 60),
         }
     }
 
@@ -485,7 +486,7 @@ impl Ftp {
                 }
                 (c, _) => line.starts_with(&format!("{c} ")) || line == c.to_string(),
             };
-            if self.verbose || code >= 400 {
+            if self.verbose || code >= 500 {
                 println!("{line}");
             }
             if code == 0 {
@@ -683,7 +684,6 @@ impl Ftp {
         }
         let ok = self.reply().code / 100 == 2;
         if let Ok(n) = result
-            && ok
             && n > 0
             && self.verbose
         {
@@ -892,12 +892,7 @@ impl Ftp {
                     for file in self.remote_glob(pattern) {
                         match self.confirm(name, &file) {
                             Answer::Yes if name == "mget" => {
-                                // Names come from the server: keep only the file name so a
-                                // listing like `../x` or `C:\x` can't write outside the cwd.
-                                if let Some(local) = Path::new(&file)
-                                    .file_name()
-                                    .and_then(|local| local.to_str())
-                                {
+                                if let Some(local) = mget_target(&file) {
                                     self.get(format!("RETR {file}"), local);
                                 }
                             }
@@ -997,6 +992,19 @@ impl Ftp {
             _ => println!("Invalid command."),
         }
     }
+}
+
+/// Local name for a server-supplied mget name: as-is like ftp.exe while it stays inside
+/// the current directory, else only its file name, so `../x` or `C:\x` can't escape it.
+fn mget_target(name: &str) -> Option<&str> {
+    let path = Path::new(name);
+    let inside = path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+    if inside {
+        return Some(name);
+    }
+    path.file_name()?.to_str()
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -1393,15 +1401,16 @@ mod tests {
         let (mut f, s) = connected("");
         let files = vec![
             ("a", "new"),
-            ("*", "../evil.txt\r\nsub/ok.txt\r\n"),
+            ("*", "../evil.txt\r\n/abs.txt\r\nsub/ok.txt\r\n"),
             ("../evil.txt", "evil"),
+            ("/abs.txt", "abs"),
             ("sub/ok.txt", "ok"),
         ];
         let srv = fake(s, files);
         f.prompt = false;
         let dir = tmpdir("get");
         let work = dir.join("work");
-        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(work.join("sub")).unwrap();
         let x = work.join("x");
         fs::write(&x, "keep").unwrap();
         fs::write(work.join("x.part"), "mine").unwrap();
@@ -1415,7 +1424,8 @@ mod tests {
         env::set_current_dir(&work).unwrap(); // only this test depends on the cwd
         f.exec("mget *");
         assert_eq!(fs::read_to_string(work.join("evil.txt")).unwrap(), "evil");
-        assert_eq!(fs::read_to_string(work.join("ok.txt")).unwrap(), "ok");
+        assert_eq!(fs::read_to_string(work.join("abs.txt")).unwrap(), "abs");
+        assert_eq!(fs::read_to_string(work.join("sub/ok.txt")).unwrap(), "ok"); // Kept, like ftp.exe.
         assert!(!dir.join("evil.txt").exists()); // server names can't escape the cwd
         drop(f);
         srv.join().unwrap();
