@@ -130,6 +130,8 @@ struct Ftp {
     timeout: Duration,
 }
 
+type Sink<'a> = Box<dyn Write + 'a>;
+
 enum Data {
     Listen(TcpListener),
     Conn(TcpStream),
@@ -569,7 +571,9 @@ impl Ftp {
         ok && res.is_ok()
     }
 
-    fn recv(&mut self, cmd: &str, out: &mut dyn Write) -> bool {
+    /// Runs a download command. `open` creates the output only after the server accepted
+    /// the command, so a failed RETR never truncates an existing local file.
+    fn recv<'a>(&mut self, cmd: &str, open: impl FnOnce() -> io::Result<Sink<'a>>) -> bool {
         let Some(data) = self.data() else {
             return false;
         };
@@ -580,31 +584,21 @@ impl Ftp {
         let ascii = !self.binary;
         let res = data
             .open(self.timeout)
-            .and_then(|mut s| self.copy(&mut s, out, ascii));
+            .and_then(|mut s| open().and_then(|mut out| self.copy(&mut s, &mut *out, ascii)));
         self.finish(res, start, "received")
     }
 
     fn get(&mut self, cmd: String, local: &str) {
         if local == "-" {
-            self.recv(&cmd, &mut io::stdout());
+            self.recv(&cmd, || Ok(Box::new(io::stdout())));
             return;
         }
-        // Write to a temp file so a failed transfer never clobbers an existing file.
-        let tmp = format!("{local}.part");
-        let Ok(f) = File::create(&tmp) else {
-            println!("Error opening local file {local}.");
-            return;
-        };
-        let mut f = BufWriter::with_capacity(self.bufsize, f);
-        let ok = self.recv(&cmd, &mut f);
-        drop(f);
-        if ok && fs::rename(&tmp, local).is_ok() {
-            return;
-        }
-        fs::remove_file(&tmp).ok();
-        if ok {
-            println!("Error opening local file {local}.");
-        }
+        let cap = self.bufsize;
+        self.recv(&cmd, || {
+            let f = File::create(local)
+                .inspect_err(|_| println!("Error opening local file {local}."))?;
+            Ok(Box::new(BufWriter::with_capacity(cap, f)))
+        });
     }
 
     fn put(&mut self, verb: &str, local: &str, remote: &str) {
@@ -630,7 +624,7 @@ impl Ftp {
         }
         let mut buf = Vec::new();
         let v = std::mem::replace(&mut self.verbose, false);
-        self.recv(&format!("NLST {pat}"), &mut buf);
+        self.recv(&format!("NLST {pat}"), || Ok(Box::new(&mut buf)));
         self.verbose = v;
         String::from_utf8_lossy(&buf)
             .lines()
@@ -765,7 +759,14 @@ impl Ftp {
                 for pat in &a {
                     for f in self.remote_glob(pat) {
                         match self.confirm(name, &f) {
-                            Some(true) if name == "mget" => self.get(format!("RETR {f}"), &f),
+                            Some(true) if name == "mget" => {
+                                // Names come from the server: keep only the file name so a
+                                // listing like `../x` or `C:\x` can't write outside the cwd.
+                                if let Some(n) = Path::new(&f).file_name().and_then(|n| n.to_str())
+                                {
+                                    self.get(format!("RETR {f}"), n);
+                                }
+                            }
                             Some(true) => _ = self.code(&format!("DELE {f}")),
                             Some(false) => {}
                             None => return,
@@ -781,7 +782,7 @@ impl Ftp {
                 if local != "-" && self.confirm("output to local-file:", &local) != Some(true) {
                     return;
                 }
-                let mut out: Box<dyn Write> = if local == "-" {
+                let mut out: Sink = if local == "-" {
                     Box::new(io::stdout())
                 } else {
                     match File::create(&local) {
@@ -794,7 +795,7 @@ impl Ftp {
                 };
                 let verb = if name == "mdir" { "LIST" } else { "NLST" };
                 for r in &a {
-                    self.recv(&format!("{verb} {r}"), &mut out);
+                    self.recv(&format!("{verb} {r}"), || Ok(Box::new(&mut out)));
                 }
             }
             "mkdir" => {
@@ -1168,8 +1169,42 @@ mod tests {
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
         let d = env::temp_dir().join(format!("ftp-test-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&d).ok();
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn downloads() {
+        let (mut f, s) = connected("");
+        let files = vec![
+            ("a", "new"),
+            ("*", "../evil.txt\r\nsub/ok.txt\r\n"),
+            ("../evil.txt", "evil"),
+            ("sub/ok.txt", "ok"),
+        ];
+        let srv = fake(s, files);
+        (f.passive, f.prompt) = (true, false);
+        let dir = tmpdir("get");
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let x = work.join("x");
+        fs::write(&x, "keep").unwrap();
+        fs::write(work.join("x.part"), "mine").unwrap();
+
+        f.get("RETR missing".into(), x.to_str().unwrap());
+        assert_eq!(fs::read_to_string(&x).unwrap(), "keep"); // 550: local file untouched
+        f.get("RETR a".into(), x.to_str().unwrap());
+        assert_eq!(fs::read_to_string(&x).unwrap(), "new");
+        assert_eq!(fs::read_to_string(work.join("x.part")).unwrap(), "mine");
+
+        env::set_current_dir(&work).unwrap(); // only this test depends on the cwd
+        f.exec("mget *");
+        assert_eq!(fs::read_to_string(work.join("evil.txt")).unwrap(), "evil");
+        assert_eq!(fs::read_to_string(work.join("ok.txt")).unwrap(), "ok");
+        assert!(!dir.join("evil.txt").exists()); // server names can't escape the cwd
+        drop(f);
+        srv.join().unwrap();
     }
 
     #[test]
