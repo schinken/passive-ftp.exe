@@ -579,8 +579,8 @@ impl Ftp {
         if !self.need(&mut a, 1, &["To "]) {
             return;
         }
-        let host = a[0].clone();
-        let port = a.get(1).and_then(|p| p.parse().ok()).unwrap_or(21);
+        let port: u16 = a.get(1).and_then(|p| p.parse().ok()).unwrap_or(21);
+        let host = a.swap_remove(0);
         let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
             Ok(it) => it.collect(),
             Err(_) => {
@@ -612,38 +612,32 @@ impl Ftp {
         }
     }
 
-    fn login(&mut self, mut a: Vec<String>) {
-        if a.is_empty() {
-            if self.anon {
-                let me = env::var("USERNAME").unwrap_or_default();
-                let host = env::var("COMPUTERNAME").unwrap_or_default();
-                a = vec!["anonymous".into(), format!("{me}@{host}")];
-            } else {
-                let p = format!("User ({}:(none)): ", self.host);
-                let Some(u) = self.ask(&p) else { return };
-                a.push(u);
-            }
-        }
-        let mut code = self.code(&format!("USER {}", a[0]));
+    fn login(&mut self, args: Vec<String>) {
+        let args = if args.is_empty() && self.anon {
+            let me = env::var("USERNAME").unwrap_or_default();
+            let host = env::var("COMPUTERNAME").unwrap_or_default();
+            vec!["anonymous".into(), format!("{me}@{host}")]
+        } else {
+            args
+        };
+        let mut args = args.into_iter();
+        let (user, pass, account) = (args.next(), args.next(), args.next());
+        let prompt = format!("User ({}:(none)): ", self.host);
+        let Some(user) = user.or_else(|| self.ask(&prompt)) else {
+            return;
+        };
+        let mut code = self.code(&format!("USER {user}"));
         if code == 331 {
-            let pass = match a.get(1) {
-                Some(p) => p.clone(),
-                None => match self.ask_secret("Password:") {
-                    Some(p) => p,
-                    None => return,
-                },
+            let Some(pass) = pass.or_else(|| self.ask_secret("Password:")) else {
+                return;
             };
             code = self.code(&format!("PASS {pass}"));
         }
         if code == 332 {
-            let acct = match a.get(2) {
-                Some(p) => p.clone(),
-                None => match self.ask("Account:") {
-                    Some(p) => p,
-                    None => return,
-                },
+            let Some(account) = account.or_else(|| self.ask("Account:")) else {
+                return;
             };
-            code = self.code(&format!("ACCT {acct}"));
+            code = self.code(&format!("ACCT {account}"));
         }
         if code / 100 != 2 {
             println!("Login failed.");
