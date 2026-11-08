@@ -81,9 +81,30 @@ const CMDS: &[(&str, &str)] = &[
 ];
 
 const NEEDS_CONN: &[&str] = &[
-    "append", "cd", "close", "delete", "dir", "disconnect", "get", "literal", "ls", "mdelete",
-    "mdir", "mget", "mkdir", "mls", "mput", "put", "pwd", "quote", "recv", "remotehelp", "rename",
-    "rmdir", "send", "user",
+    "append",
+    "cd",
+    "close",
+    "delete",
+    "dir",
+    "disconnect",
+    "get",
+    "literal",
+    "ls",
+    "mdelete",
+    "mdir",
+    "mget",
+    "mkdir",
+    "mls",
+    "mput",
+    "put",
+    "pwd",
+    "quote",
+    "recv",
+    "remotehelp",
+    "rename",
+    "rmdir",
+    "send",
+    "user",
 ];
 
 const HASH_BYTES: u64 = 2048;
@@ -128,7 +149,10 @@ impl Data {
                         Ok((s, _)) => break s,
                         Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
                         Err(_) if Instant::now() >= end => {
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, "no data connection from server"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "no data connection from server",
+                            ));
                         }
                         Err(_) => thread::sleep(Duration::from_millis(5)),
                     }
@@ -167,7 +191,10 @@ impl Ftp {
     }
 
     /// Applies ftp.exe flags. Returns (script, host args), or None to show usage.
-    fn parse_args(&mut self, args: impl IntoIterator<Item = String>) -> Option<(Option<String>, Vec<String>)> {
+    fn parse_args(
+        &mut self,
+        args: impl IntoIterator<Item = String>,
+    ) -> Option<(Option<String>, Vec<String>)> {
         let mut script = None;
         let mut host = Vec::new();
         for arg in args {
@@ -237,7 +264,9 @@ impl Ftp {
             return None;
         }
         let line = String::from_utf8_lossy(&buf);
-        let line = line.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']);
+        let line = line
+            .trim_start_matches('\u{feff}')
+            .trim_end_matches(['\r', '\n']);
         // Like ftp.exe: echo script input so logs show what ran.
         if hide || !self.tty {
             println!("{}", if secret { "" } else { line });
@@ -278,7 +307,9 @@ impl Ftp {
         let mut text = String::new();
         let mut code = 0;
         loop {
-            let Some(r) = self.ctrl.as_mut() else { return (0, text) };
+            let Some(r) = self.ctrl.as_mut() else {
+                return (0, text);
+            };
             let mut buf = Vec::new();
             match r.read_until(b'\n', &mut buf) {
                 Ok(1..) => {}
@@ -321,9 +352,19 @@ impl Ftp {
             return (0, String::new());
         };
         if self.debug {
-            println!("---> {}", if line.starts_with("PASS ") { "PASS XXXX" } else { line });
+            println!(
+                "---> {}",
+                if line.starts_with("PASS ") {
+                    "PASS XXXX"
+                } else {
+                    line
+                }
+            );
         }
-        if r.get_mut().write_all(format!("{line}\r\n").as_bytes()).is_err() {
+        if r.get_mut()
+            .write_all(format!("{line}\r\n").as_bytes())
+            .is_err()
+        {
             self.lost("Connection closed by remote host.");
             return (0, String::new());
         }
@@ -463,7 +504,15 @@ impl Ftp {
         let cmd = match local.ip() {
             IpAddr::V4(ip) => {
                 let o = ip.octets();
-                format!("PORT {},{},{},{},{},{}", o[0], o[1], o[2], o[3], p >> 8, p & 255)
+                format!(
+                    "PORT {},{},{},{},{},{}",
+                    o[0],
+                    o[1],
+                    o[2],
+                    o[3],
+                    p >> 8,
+                    p & 255
+                )
             }
             IpAddr::V6(ip) => format!("EPRT |2|{ip}|{p}|"),
         };
@@ -521,13 +570,17 @@ impl Ftp {
     }
 
     fn recv(&mut self, cmd: &str, out: &mut dyn Write) -> bool {
-        let Some(data) = self.data() else { return false };
+        let Some(data) = self.data() else {
+            return false;
+        };
         if self.code(cmd) / 100 != 1 {
             return false;
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data.open(self.timeout).and_then(|mut s| self.copy(&mut s, out, ascii));
+        let res = data
+            .open(self.timeout)
+            .and_then(|mut s| self.copy(&mut s, out, ascii));
         self.finish(res, start, "received")
     }
 
@@ -565,7 +618,9 @@ impl Ftp {
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data.open(self.timeout).and_then(|mut s| self.copy(&mut f, &mut s, ascii));
+        let res = data
+            .open(self.timeout)
+            .and_then(|mut s| self.copy(&mut f, &mut s, ascii));
         self.finish(res, start, "sent");
     }
 
@@ -577,7 +632,11 @@ impl Ftp {
         let v = std::mem::replace(&mut self.verbose, false);
         self.recv(&format!("NLST {pat}"), &mut buf);
         self.verbose = v;
-        String::from_utf8_lossy(&buf).lines().filter(|l| !l.is_empty()).map(String::from).collect()
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
     }
 
     fn local_glob(&self, pat: &str) -> Vec<String> {
@@ -585,8 +644,13 @@ impl Ftp {
             return vec![pat.into()];
         }
         let p = Path::new(pat);
-        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let Some(fpat) = p.file_name().and_then(|f| f.to_str()) else { return vec![] };
+        let dir = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let Some(fpat) = p.file_name().and_then(|f| f.to_str()) else {
+            return vec![];
+        };
         let mut v: Vec<String> = fs::read_dir(dir)
             .into_iter()
             .flatten()
@@ -682,7 +746,11 @@ impl Ftp {
                 println!("Local directory now {}.", cwd.display());
             }
             "literal" | "quote" => {
-                let line = if rest.is_empty() { self.ask("Command line to send ", false) } else { Some(rest.into()) };
+                let line = if rest.is_empty() {
+                    self.ask("Command line to send ", false)
+                } else {
+                    Some(rest.into())
+                };
                 if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
                     let mut code = self.code(&line);
                     while code / 100 == 1 {
@@ -761,7 +829,9 @@ impl Ftp {
                 self.verbose = v;
             }
             "rename" => {
-                if self.need(&mut a, 2, &["From name ", "To name "]) && self.code(&format!("RNFR {}", a[0])) == 350 {
+                if self.need(&mut a, 2, &["From name ", "To name "])
+                    && self.code(&format!("RNFR {}", a[0])) == 350
+                {
                     self.code(&format!("RNTO {}", a[1]));
                 }
             }
@@ -773,7 +843,10 @@ impl Ftp {
             "status" => self.status(),
             "trace" => toggle(&mut self.trace, "Packet tracing"),
             "type" => match a.first().map(|s| s.to_lowercase()).as_deref() {
-                None => println!("Using {} mode to transfer files.", if self.binary { "binary" } else { "ascii" }),
+                None => println!(
+                    "Using {} mode to transfer files.",
+                    if self.binary { "binary" } else { "ascii" }
+                ),
                 Some("ascii") => self.set_type(false),
                 Some("binary" | "image") => self.set_type(true),
                 Some(m) => println!("{m}: unknown mode."),
@@ -800,7 +873,11 @@ fn toggle(flag: &mut bool, what: &str) {
 
 /// Code and "more lines follow" flag if `line` starts a reply (`123 text` / `123-text`).
 fn reply_start(line: &str) -> Option<(u16, bool)> {
-    let code = line.get(..3).filter(|c| c.bytes().all(|b| b.is_ascii_digit()))?.parse().ok()?;
+    let code = line
+        .get(..3)
+        .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
     match line.as_bytes().get(3) {
         None | Some(b' ') => Some((code, false)),
         Some(b'-') => Some((code, true)),
@@ -812,7 +889,11 @@ fn reply_start(line: &str) -> Option<(u16, bool)> {
 fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
         227 => {
-            let n: Vec<u16> = text[3..].split(|c: char| !c.is_ascii_digit()).filter_map(|x| x.parse().ok()).take(6).collect();
+            let n: Vec<u16> = text[3..]
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|x| x.parse().ok())
+                .take(6)
+                .collect();
             Some(n.get(4)? << 8 | n.get(5)?)
         }
         229 => text.split('|').nth(3)?.parse().ok(),
@@ -869,7 +950,10 @@ fn lookup(name: &str) -> Result<usize, &'static str> {
     if let Some(i) = CMDS.iter().position(|c| c.0 == name) {
         return Ok(i);
     }
-    let mut hits = CMDS.iter().enumerate().filter(|(_, c)| c.0.starts_with(name));
+    let mut hits = CMDS
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.0.starts_with(name));
     match (hits.next(), hits.next()) {
         (Some((i, _)), None) => Ok(i),
         (Some(_), Some(_)) => Err("Ambiguous command."),
@@ -888,7 +972,10 @@ fn help(arg: Option<&String>) {
     println!("Commands may be abbreviated.  Commands are:\n");
     let rows = CMDS.len().div_ceil(5);
     for r in 0..rows {
-        let line: String = (r..CMDS.len()).step_by(rows).map(|i| format!("{:<16}", CMDS[i].0)).collect();
+        let line: String = (r..CMDS.len())
+            .step_by(rows)
+            .map(|i| format!("{:<16}", CMDS[i].0))
+            .collect();
         println!("{}", line.trim_end());
     }
 }
@@ -925,7 +1012,14 @@ fn console_echo(on: bool) {
         let h = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode = 0;
         if GetConsoleMode(h, &mut mode) != 0 {
-            SetConsoleMode(h, if on { mode | ENABLE_ECHO_INPUT } else { mode & !ENABLE_ECHO_INPUT });
+            SetConsoleMode(
+                h,
+                if on {
+                    mode | ENABLE_ECHO_INPUT
+                } else {
+                    mode & !ENABLE_ECHO_INPUT
+                },
+            );
         }
     }
 }
@@ -951,7 +1045,9 @@ fn main() {
         f.open(host);
     }
     loop {
-        let Some(line) = f.ask("ftp> ", false) else { f.quit() };
+        let Some(line) = f.ask("ftp> ", false) else {
+            f.quit()
+        };
         f.exec(&line);
     }
 }
@@ -962,9 +1058,15 @@ mod tests {
 
     #[test]
     fn helpers() {
-        assert_eq!(pasv_port(227, "227 Entering Passive Mode (10,0,0,1,195,80)."), Some(195 * 256 + 80));
+        assert_eq!(
+            pasv_port(227, "227 Entering Passive Mode (10,0,0,1,195,80)."),
+            Some(195 * 256 + 80)
+        );
         assert_eq!(pasv_port(227, "227 =10,0,0,1,4,1"), Some(1025));
-        assert_eq!(pasv_port(229, "229 Entering Extended Passive Mode (|||6446|)"), Some(6446));
+        assert_eq!(
+            pasv_port(229, "229 Entering Extended Passive Mode (|||6446|)"),
+            Some(6446)
+        );
         assert_eq!(pasv_port(500, "500 nope"), None);
 
         let (mut cr, mut out) = (false, Vec::new());
@@ -973,9 +1075,14 @@ mod tests {
         to_crlf(b"\nc\n", &mut cr, &mut out); // CRLF split across chunks stays CRLF
         assert_eq!(out, b"\nc\r\n");
 
-        assert!(wild(b"*.TXT", b"a.txt") && wild(b"f?o*", b"foo.bar") && !wild(b"*.txt", b"a.txt.bak"));
+        assert!(
+            wild(b"*.TXT", b"a.txt") && wild(b"f?o*", b"foo.bar") && !wild(b"*.txt", b"a.txt.bak")
+        );
 
-        assert_eq!(split_args(r#"put "C:\my file.txt"  x"#), ["put", r"C:\my file.txt", "x"]);
+        assert_eq!(
+            split_args(r#"put "C:\my file.txt"  x"#),
+            ["put", r"C:\my file.txt", "x"]
+        );
         assert_eq!(split_args(r#"a "" b"#), ["a", "", "b"]);
 
         assert_eq!(lookup("bi").map(|i| CMDS[i].0), Ok("binary"));
@@ -988,10 +1095,27 @@ mod tests {
     fn flags() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut f = Ftp::new(Box::new(io::empty()), false);
-        let (script, host) = f.parse_args(args(&["-inv", "-p", "-s:x y.txt", "-w:10", "-x:1", "host", "21"])).unwrap();
-        assert_eq!((script.as_deref(), host), (Some("x y.txt"), args(&["host", "21"])));
+        let (script, host) = f
+            .parse_args(args(&[
+                "-inv",
+                "-p",
+                "-s:x y.txt",
+                "-w:10",
+                "-x:1",
+                "host",
+                "21",
+            ]))
+            .unwrap();
+        assert_eq!(
+            (script.as_deref(), host),
+            (Some("x y.txt"), args(&["host", "21"]))
+        );
         assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.bufsize == 10);
-        assert!(Ftp::new(Box::new(io::empty()), false).parse_args(args(&["-?"])).is_none());
+        assert!(
+            Ftp::new(Box::new(io::empty()), false)
+                .parse_args(args(&["-?"]))
+                .is_none()
+        );
     }
 
     /// Ftp wired to a local socket; returns the server end. `input` feeds prompts.
@@ -1035,7 +1159,9 @@ mod tests {
                     },
                     _ => "200 ok".into(),
                 };
-                r.get_mut().write_all(format!("{reply}\r\n").as_bytes()).unwrap();
+                r.get_mut()
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .unwrap();
             }
         })
     }
@@ -1061,7 +1187,10 @@ mod tests {
     #[test]
     fn replies() {
         let (mut f, mut s) = connected("");
-        s.write_all(b"junk line\r\n\r\n220 ready\r\n230-multi\r\n 230 not the end\r\n230\r\n331 next\r\n").unwrap();
+        s.write_all(
+            b"junk line\r\n\r\n220 ready\r\n230-multi\r\n 230 not the end\r\n230\r\n331 next\r\n",
+        )
+        .unwrap();
         assert_eq!(f.reply(), (220, "220 ready\n".into()));
         assert_eq!(f.reply().0, 230);
         assert_eq!(f.reply().0, 331);
