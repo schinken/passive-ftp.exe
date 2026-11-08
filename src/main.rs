@@ -132,6 +132,31 @@ struct Ftp {
 
 type Sink<'a> = Box<dyn Write + 'a>;
 
+/// Console output that replaces invalid UTF-8: Windows consoles reject such bytes,
+/// which a listing with Latin-1 file names would otherwise trigger.
+// ponytail: a multi-byte character split across two reads prints as two U+FFFD.
+struct Console;
+
+impl Write for Console {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        print!("{}", String::from_utf8_lossy(b));
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+/// Raw bytes when redirected, lossy text on a console.
+fn stdout_sink() -> Sink<'static> {
+    if io::stdout().is_terminal() {
+        Box::new(Console)
+    } else {
+        Box::new(io::stdout())
+    }
+}
+
 enum Data {
     Listen(TcpListener),
     Conn(TcpStream),
@@ -590,7 +615,7 @@ impl Ftp {
 
     fn get(&mut self, cmd: String, local: &str) {
         if local == "-" {
-            self.recv(&cmd, || Ok(Box::new(io::stdout())));
+            self.recv(&cmd, || Ok(stdout_sink()));
             return;
         }
         let cap = self.bufsize;
@@ -783,7 +808,7 @@ impl Ftp {
                     return;
                 }
                 let mut out: Sink = if local == "-" {
-                    Box::new(io::stdout())
+                    stdout_sink()
                 } else {
                     match File::create(&local) {
                         Ok(f) => Box::new(BufWriter::new(f)),
@@ -1090,6 +1115,11 @@ mod tests {
         assert_eq!(lookup("dir").map(|i| CMDS[i].0), Ok("dir"));
         assert_eq!(lookup("d"), Err("Ambiguous command."));
         assert_eq!(lookup("xyz"), Err("Invalid command."));
+    }
+
+    #[test]
+    fn console_accepts_invalid_utf8() {
+        assert_eq!(Console.write(b"B\xfccher\n").unwrap(), 7);
     }
 
     #[test]
