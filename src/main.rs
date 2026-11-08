@@ -1,19 +1,18 @@
-//! Drop-in replacement for Windows `ftp.exe` that adds passive mode (`-p`).
+//! Drop-in replacement for Windows `ftp.exe` that uses passive mode for all transfers.
 
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "
 Transfers files to and from a computer running an FTP server service
 (sometimes called a daemon). Ftp can be used interactively.
 
-FTP [-v] [-d] [-i] [-n] [-g] [-p] [-s:filename] [-a] [-A] [-x:sendbuffer] [-r:recvbuffer] [-b:asyncbuffers] [-w:windowsize] [host]
+FTP [-v] [-d] [-i] [-n] [-g] [-s:filename] [-a] [-A] [-x:sendbuffer] [-r:recvbuffer] [-b:asyncbuffers] [-w:windowsize] [host]
 
   -v              Suppresses display of remote server responses.
   -n              Suppresses auto-login upon initial connection.
@@ -21,7 +20,6 @@ FTP [-v] [-d] [-i] [-n] [-g] [-p] [-s:filename] [-a] [-A] [-x:sendbuffer] [-r:re
                   transfers.
   -d              Enables debugging.
   -g              Disables filename globbing (see GLOB command).
-  -p              Uses passive mode (PASV/EPSV) for data connections.
   -s:filename     Specifies a text file containing FTP commands; the
                   commands will automatically run after FTP starts.
   -a              Use any local interface when binding data connection.
@@ -256,8 +254,6 @@ struct Ftp {
     hash: bool,
     bell: bool,
     trace: bool,
-    passive: bool,
-    any_interface: bool,
     autologin: bool,
     anonymous: bool,
     binary: bool,
@@ -312,42 +308,6 @@ fn stdout_sink() -> Sink<'static> {
     }
 }
 
-enum Data {
-    Listen(TcpListener),
-    Connected(TcpStream),
-}
-
-impl Data {
-    /// Waits at most `timeout` for the server's data connection; reads and writes then time out after `timeout`.
-    fn open(self, timeout: Duration) -> io::Result<TcpStream> {
-        let stream = match self {
-            Data::Connected(stream) => stream,
-            Data::Listen(listener) => {
-                // ponytail: polls accept() every 5 ms (std has no accept timeout). WSAPoll would avoid the wakeups.
-                listener.set_nonblocking(true)?;
-                let deadline = Instant::now() + timeout;
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
-                        Err(_) if Instant::now() >= deadline => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "no data connection from server",
-                            ));
-                        }
-                        Err(_) => thread::sleep(Duration::from_millis(5)),
-                    }
-                }
-            }
-        };
-        stream.set_nonblocking(false)?; // Accepted sockets inherit non-blocking mode on Windows.
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        Ok(stream)
-    }
-}
-
 impl Ftp {
     fn new(input: Box<dyn BufRead>, tty: bool) -> Self {
         Ftp {
@@ -362,8 +322,6 @@ impl Ftp {
             hash: false,
             bell: false,
             trace: false,
-            passive: false,
-            any_interface: false,
             autologin: true,
             anonymous: false,
             binary: false,
@@ -388,9 +346,8 @@ impl Ftp {
                     'i' => self.prompt = false,
                     'n' => self.autologin = false,
                     'g' => self.glob = false,
-                    'a' => self.any_interface = true,
+                    'a' => {} // Data connections are passive: nothing to bind locally.
                     'A' => self.anonymous = true,
-                    'p' => self.passive = true,
                     's' | 'w' | 'x' | 'r' | 'b' => {
                         let v = opts[i + 1..].trim_start_matches(':');
                         match c {
@@ -670,51 +627,22 @@ impl Ftp {
         }
     }
 
-    /// Prepares the data connection: PASV/EPSV when passive, PORT/EPRT otherwise.
-    fn data(&mut self) -> Option<Data> {
-        let control = self.control.as_ref()?.get_ref();
-        let (local, peer) = (control.local_addr().ok()?, control.peer_addr().ok()?);
-        if self.passive {
-            let reply = self.command(if peer.is_ipv4() { "PASV" } else { "EPSV" });
-            let port = pasv_port(reply.code, &reply.text)?;
-            // The address in a PASV reply is ignored (NAT-safe, like curl): always use the control peer.
-            return match TcpStream::connect((peer.ip(), port)) {
-                Ok(stream) => Some(Data::Connected(stream)),
-                Err(e) => {
-                    println!("> ftp: connect :{e}");
-                    None
-                }
-            };
-        }
-        let bind_ip: IpAddr = match (self.any_interface, local.ip()) {
-            (false, ip) => ip,
-            (true, IpAddr::V4(_)) => Ipv4Addr::UNSPECIFIED.into(),
-            (true, IpAddr::V6(_)) => Ipv6Addr::UNSPECIFIED.into(),
-        };
-        let listener = match TcpListener::bind((bind_ip, 0)) {
-            Ok(listener) => listener,
+    /// Opens the data connection with PASV (IPv4) or EPSV (IPv6).
+    fn data_connection(&mut self) -> Option<TcpStream> {
+        let peer = self.control.as_ref()?.get_ref().peer_addr().ok()?;
+        let reply = self.command(if peer.is_ipv4() { "PASV" } else { "EPSV" });
+        let port = pasv_port(reply.code, &reply.text)?;
+        // The address in a PASV reply is ignored (NAT-safe, like curl): always use the control peer.
+        let stream = match TcpStream::connect((peer.ip(), port)) {
+            Ok(stream) => stream,
             Err(e) => {
-                println!("> ftp: bind :{e}");
+                println!("> ftp: connect :{e}");
                 return None;
             }
         };
-        let port = listener.local_addr().ok()?.port();
-        let command = match local.ip() {
-            IpAddr::V4(ip) => {
-                let octets = ip.octets();
-                format!(
-                    "PORT {},{},{},{},{},{}",
-                    octets[0],
-                    octets[1],
-                    octets[2],
-                    octets[3],
-                    port >> 8,
-                    port & 255
-                )
-            }
-            IpAddr::V6(ip) => format!("EPRT |2|{ip}|{port}|"),
-        };
-        (self.send(&command) / 100 == 2).then_some(Data::Listen(listener))
+        stream.set_read_timeout(Some(self.timeout)).ok();
+        stream.set_write_timeout(Some(self.timeout)).ok();
+        Some(stream)
     }
 
     fn copy(&self, reader: &mut dyn Read, writer: &mut dyn Write, ascii: bool) -> io::Result<u64> {
@@ -773,7 +701,7 @@ impl Ftp {
     /// Runs a download command. `open` creates the output only after the server accepted
     /// the command, so a failed RETR never truncates an existing local file.
     fn receive<'a>(&mut self, command: &str, open: impl FnOnce() -> io::Result<Sink<'a>>) -> bool {
-        let Some(data) = self.data() else {
+        let Some(mut stream) = self.data_connection() else {
             return false;
         };
         if self.send(command) / 100 != 1 {
@@ -781,9 +709,8 @@ impl Ftp {
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let result = data
-            .open(self.timeout)
-            .and_then(|mut s| open().and_then(|mut out| self.copy(&mut s, &mut *out, ascii)));
+        let result = open().and_then(|mut out| self.copy(&mut stream, &mut *out, ascii));
+        drop(stream);
         self.finish(result, start, "received")
     }
 
@@ -805,15 +732,16 @@ impl Ftp {
             println!("Error opening local file {local}.");
             return;
         };
-        let Some(data) = self.data() else { return };
+        let Some(mut stream) = self.data_connection() else {
+            return;
+        };
         if self.send(&format!("{verb} {remote}")) / 100 != 1 {
             return;
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let result = data
-            .open(self.timeout)
-            .and_then(|mut s| self.copy(&mut f, &mut s, ascii));
+        let result = self.copy(&mut f, &mut stream, ascii);
+        drop(stream); // The server needs EOF before it confirms the upload.
         self.finish(result, start, "sent");
     }
 
@@ -876,10 +804,9 @@ impl Ftp {
             on_off(self.glob)
         );
         println!(
-            "Debugging: {} ; Hash mark printing: {} ; Passive: {} .",
+            "Debugging: {} ; Hash mark printing: {} .",
             on_off(self.debug),
-            on_off(self.hash),
-            on_off(self.passive)
+            on_off(self.hash)
         );
     }
 
@@ -1312,6 +1239,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn helpers() {
@@ -1373,7 +1302,7 @@ mod tests {
         let CommandLine { script, host } = f
             .parse_args(args(&[
                 "-inv",
-                "-p",
+                "-a",
                 "-s:x y.txt",
                 "-w:10",
                 "-x:1",
@@ -1385,11 +1314,16 @@ mod tests {
             (script.as_deref(), host),
             (Some("x y.txt"), args(&["host", "21"]))
         );
-        assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.buffer_size == 10);
+        assert!(!f.prompt && !f.autologin && !f.verbose && f.buffer_size == 10);
         assert!(
             Ftp::new(Box::new(io::empty()), false)
                 .parse_args(args(&["-?"]))
                 .is_none()
+        );
+        let unknown = Ftp::new(Box::new(io::empty()), false).parse_args(args(&["-p", "host"]));
+        assert!(
+            unknown.is_none(),
+            "like ftp.exe, unknown flags such as -p show the usage"
         );
     }
 
@@ -1403,7 +1337,7 @@ mod tests {
     }
 
     /// Minimal FTP server: passive data, `files` as (name, content).
-    /// `RETR hang` answers 150 then 425 and never connects (a firewalled active-mode transfer).
+    /// `RETR stall` opens the data connection but never sends data or a final reply.
     fn fake(s: TcpStream, files: Vec<(&'static str, &'static str)>) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let mut r = BufReader::new(s);
@@ -1422,7 +1356,13 @@ mod tests {
                         data = Some(l);
                         format!("227 ok (127,0,0,1,{},{})", p >> 8, p & 255)
                     }
-                    "RETR" if arg == "hang" => "150 ok\r\n425 no connection".into(),
+                    "RETR" if arg == "stall" => {
+                        r.get_mut().write_all(b"150 ok\r\n").unwrap();
+                        let _data = data.take().unwrap().accept().unwrap();
+                        // Hold everything open until the client gives up.
+                        r.read_line(&mut String::new()).ok();
+                        return;
+                    }
                     "RETR" | "NLST" => match files.iter().find(|f| f.0 == arg) {
                         Some((_, body)) => {
                             r.get_mut().write_all(b"150 ok\r\n").unwrap();
@@ -1458,7 +1398,7 @@ mod tests {
             ("sub/ok.txt", "ok"),
         ];
         let srv = fake(s, files);
-        (f.passive, f.prompt) = (true, false);
+        f.prompt = false;
         let dir = tmpdir("get");
         let work = dir.join("work");
         fs::create_dir_all(&work).unwrap();
@@ -1482,14 +1422,18 @@ mod tests {
     }
 
     #[test]
-    fn active_mode_gives_up_when_server_never_connects() {
+    fn stalled_transfer_times_out() {
         let (mut f, s) = connected("");
         let srv = fake(s, vec![]);
-        f.timeout = Duration::from_millis(500);
-        let local = tmpdir("hang").join("x");
-        f.get("RETR hang".into(), local.to_str().unwrap()); // used to block in accept() forever
-        assert!(!local.exists());
-        drop(f);
+        f.timeout = Duration::from_millis(300);
+        let control = f.control.as_ref().unwrap().get_ref();
+        control.set_read_timeout(Some(f.timeout)).unwrap(); // As `open` does.
+        let local = tmpdir("stall").join("x");
+        f.get("RETR stall".into(), local.to_str().unwrap());
+        assert!(
+            f.control.is_none(),
+            "a silent server must not block forever"
+        );
         srv.join().unwrap();
     }
 
