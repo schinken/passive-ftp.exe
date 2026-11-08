@@ -3,10 +3,11 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::mem;
+use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path};
-use std::process::Command;
+use std::process::{self, Command};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "
@@ -546,6 +547,7 @@ impl Ftp {
         if !self.require_args(&mut args, 1, &["To "]) {
             return;
         }
+        use std::net::ToSocketAddrs;
         let port: u16 = args.get(1).and_then(|port| port.parse().ok()).unwrap_or(21);
         let host = args.swap_remove(0);
         let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
@@ -620,7 +622,7 @@ impl Ftp {
 
     fn quit(&mut self) -> ! {
         self.close();
-        std::process::exit(0)
+        process::exit(0)
     }
 
     fn set_binary(&mut self, binary: bool) {
@@ -751,7 +753,7 @@ impl Ftp {
             return vec![pattern.into()];
         }
         let mut listing = Vec::new();
-        let was_verbose = std::mem::replace(&mut self.verbose, false);
+        let was_verbose = mem::replace(&mut self.verbose, false);
         self.receive(&format!("NLST {pattern}"), || Ok(Box::new(&mut listing)));
         self.verbose = was_verbose;
         String::from_utf8_lossy(&listing)
@@ -957,7 +959,7 @@ impl Ftp {
                     (_, Some(topic)) => format!("HELP {topic}"),
                     _ => "HELP".to_string(),
                 };
-                let was_verbose = std::mem::replace(&mut self.verbose, true);
+                let was_verbose = mem::replace(&mut self.verbose, true);
                 self.send(&command);
                 self.verbose = was_verbose;
             }
@@ -997,6 +999,7 @@ impl Ftp {
 
 /// Local name for a server-supplied mget name: as-is like ftp.exe while it stays inside
 /// the current directory, else only its file name, so `../x` or `C:\x` can't escape it.
+#[must_use]
 fn mget_target(name: &str) -> Option<&str> {
     let path = Path::new(name);
     let inside = path
@@ -1008,6 +1011,7 @@ fn mget_target(name: &str) -> Option<&str> {
     path.file_name()?.to_str()
 }
 
+#[must_use]
 fn on_off(b: bool) -> &'static str {
     if b { "On" } else { "Off" }
 }
@@ -1018,8 +1022,9 @@ fn toggle(flag: &mut bool, what: &str) {
 }
 
 /// Code and "more lines follow" flag if `line` starts a reply (`123 text` / `123-text`).
+#[must_use]
 fn reply_start(line: &str) -> Option<(u16, bool)> {
-    let code = line
+    let code: u16 = line
         .get(..3)
         .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))?
         .parse()
@@ -1032,6 +1037,7 @@ fn reply_start(line: &str) -> Option<(u16, bool)> {
 }
 
 /// Port from a 227 (PASV) or 229 (EPSV) reply.
+#[must_use]
 fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
         227 => {
@@ -1063,6 +1069,7 @@ fn to_crlf(chunk: &[u8], cr: &mut bool, out: &mut Vec<u8>) {
 
 /// Case-insensitive `*` / `?` match, as on Windows.
 // ponytail: backtracking matcher, exponential on patterns with many `*`; fine for file names.
+#[must_use]
 fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
     match (pattern.first(), text.first()) {
         (None, None) => true,
@@ -1079,6 +1086,7 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
 }
 
 /// Splits on whitespace; double quotes group words (`put "my file.txt"`).
+#[must_use]
 fn split_args(line: &str) -> Vec<String> {
     let (mut args, mut current, mut quoted, mut in_arg) = (Vec::new(), String::new(), false, false);
     for c in line.chars() {
@@ -1086,7 +1094,7 @@ fn split_args(line: &str) -> Vec<String> {
             '"' => (quoted, in_arg) = (!quoted, true),
             c if c.is_whitespace() && !quoted => {
                 if in_arg {
-                    args.push(std::mem::take(&mut current));
+                    args.push(mem::take(&mut current));
                     in_arg = false;
                 }
             }
@@ -1170,6 +1178,7 @@ fn set_console_echo(on: bool) {
 
 /// Decodes a non-UTF-8 script line with the OEM code page,
 /// which is what `echo ... >> script.txt` in cmd.exe writes.
+#[must_use]
 fn decode_oem(bytes: &[u8]) -> String {
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1231,6 +1240,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::thread;
 
     #[test]
@@ -1372,8 +1382,8 @@ mod tests {
         })
     }
 
-    fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d = env::temp_dir().join(format!("ftp-test-{name}-{}", std::process::id()));
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = env::temp_dir().join(format!("ftp-test-{name}-{}", process::id()));
         fs::remove_dir_all(&d).ok();
         fs::create_dir_all(&d).unwrap();
         d
