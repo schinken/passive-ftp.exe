@@ -90,7 +90,7 @@ const HASH_BYTES: u64 = 2048;
 struct Ftp {
     input: Box<dyn BufRead>,
     tty: bool,
-    ctrl: Option<(BufReader<TcpStream>, TcpStream)>,
+    ctrl: Option<BufReader<TcpStream>>,
     host: String,
     verbose: bool,
     debug: bool,
@@ -122,6 +122,82 @@ impl Data {
 }
 
 impl Ftp {
+    fn new(input: Box<dyn BufRead>, tty: bool) -> Self {
+        Ftp {
+            input,
+            tty,
+            ctrl: None,
+            host: String::new(),
+            verbose: true,
+            debug: false,
+            prompt: true,
+            glob: true,
+            hash: false,
+            bell: false,
+            trace: false,
+            passive: false,
+            any_iface: false,
+            autologin: true,
+            anon: false,
+            binary: false,
+            bufsize: 65536,
+        }
+    }
+
+    /// Applies ftp.exe flags. Returns (script, host args), or None to show usage.
+    fn parse_args(&mut self, args: impl IntoIterator<Item = String>) -> Option<(Option<String>, Vec<String>)> {
+        let mut script = None;
+        let mut host = Vec::new();
+        for arg in args {
+            let Some(opts) = arg.strip_prefix('-') else {
+                host.push(arg);
+                continue;
+            };
+            for (i, c) in opts.char_indices() {
+                match c {
+                    'v' => self.verbose = false,
+                    'd' => self.debug = true,
+                    'i' => self.prompt = false,
+                    'n' => self.autologin = false,
+                    'g' => self.glob = false,
+                    'a' => self.any_iface = true,
+                    'A' => self.anon = true,
+                    'p' => self.passive = true,
+                    's' | 'w' | 'x' | 'r' | 'b' => {
+                        let v = opts[i + 1..].trim_start_matches(':');
+                        match c {
+                            's' => script = Some(v.to_string()),
+                            'w' => self.bufsize = v.parse().unwrap_or(self.bufsize).max(1),
+                            _ => {} // -x/-r/-b socket tuning: the OS auto-tunes better.
+                        }
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Some((script, host))
+    }
+
+    /// Runs one command line.
+    fn exec(&mut self, line: &str) {
+        let line = line.trim();
+        let (name, rest) = match line.strip_prefix('!') {
+            Some(r) => ("!".to_string(), r),
+            None => {
+                let (n, r) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                (n.to_lowercase(), r.trim())
+            }
+        };
+        if name.is_empty() {
+            return;
+        }
+        match lookup(&name) {
+            Ok(i) => self.run(CMDS[i].0, rest, split_args(rest)),
+            Err(e) => println!("{e}"),
+        }
+    }
+
     /// Reads one line from the command source (console or -s script).
     fn ask(&mut self, prompt: &str, secret: bool) -> Option<String> {
         print!("{prompt}");
@@ -180,7 +256,7 @@ impl Ftp {
         let mut text = String::new();
         let mut code = 0;
         loop {
-            let Some((r, _)) = self.ctrl.as_mut() else { return (0, text) };
+            let Some(r) = self.ctrl.as_mut() else { return (0, text) };
             let mut buf = Vec::new();
             if !matches!(r.read_until(b'\n', &mut buf), Ok(1..)) {
                 self.lost();
@@ -209,14 +285,14 @@ impl Ftp {
     }
 
     fn cmd(&mut self, line: &str) -> (u16, String) {
-        let Some((_, w)) = self.ctrl.as_mut() else {
+        let Some(r) = self.ctrl.as_mut() else {
             println!("Not connected.");
             return (0, String::new());
         };
         if self.debug {
             println!("---> {}", if line.starts_with("PASS ") { "PASS XXXX" } else { line });
         }
-        if w.write_all(format!("{line}\r\n").as_bytes()).is_err() {
+        if r.get_mut().write_all(format!("{line}\r\n").as_bytes()).is_err() {
             self.lost();
             return (0, String::new());
         }
@@ -252,9 +328,8 @@ impl Ftp {
             }
         };
         s.set_nodelay(true).ok();
-        let Ok(r) = s.try_clone() else { return };
         println!("Connected to {host}.");
-        self.ctrl = Some((BufReader::new(r), s));
+        self.ctrl = Some(BufReader::new(s));
         self.host = host;
         self.binary = false;
         if self.reply().0 / 100 != 2 {
@@ -325,7 +400,7 @@ impl Ftp {
 
     /// Prepares the data connection: PASV/EPSV when passive, PORT/EPRT otherwise.
     fn data(&mut self) -> Option<Data> {
-        let s = &self.ctrl.as_ref()?.1;
+        let s = self.ctrl.as_ref()?.get_ref();
         let (local, peer) = (s.local_addr().ok()?, s.peer_addr().ok()?);
         if self.passive {
             let (code, text) = self.cmd(if peer.is_ipv4() { "PASV" } else { "EPSV" });
@@ -399,11 +474,12 @@ impl Ftp {
             println!("> ftp: {e}");
         }
         let ok = self.reply().0 / 100 == 2;
-        if let Ok(n) = res {
-            if n > 0 && self.verbose {
-                let kbs = n as f64 / 1000.0 / secs.max(0.001);
-                println!("ftp: {n} bytes {dir} in {secs:.2}Seconds {kbs:.2}Kbytes/sec.");
-            }
+        if let Ok(n) = res
+            && n > 0
+            && self.verbose
+        {
+            let kbs = n as f64 / 1000.0 / secs.max(0.001);
+            println!("ftp: {n} bytes {dir} in {secs:.2}Seconds {kbs:.2}Kbytes/sec.");
         }
         if self.bell {
             print!("\x07");
@@ -563,11 +639,11 @@ impl Ftp {
                 }
             }
             "lcd" => {
-                if let Some(d) = a.first() {
-                    if let Err(e) = env::set_current_dir(d) {
-                        println!("{d}: {e}");
-                        return;
-                    }
+                if let Some(d) = a.first()
+                    && let Err(e) = env::set_current_dir(d)
+                {
+                    println!("{d}: {e}");
+                    return;
                 }
                 let cwd = env::current_dir().unwrap_or_default();
                 println!("Local directory now {}.", cwd.display());
@@ -815,58 +891,11 @@ fn console_echo(on: bool) {
 fn console_echo(_on: bool) {}
 
 fn main() {
-    let mut f = Ftp {
-        input: Box::new(BufReader::new(io::stdin())),
-        tty: io::stdin().is_terminal(),
-        ctrl: None,
-        host: String::new(),
-        verbose: true,
-        debug: false,
-        prompt: true,
-        glob: true,
-        hash: false,
-        bell: false,
-        trace: false,
-        passive: false,
-        any_iface: false,
-        autologin: true,
-        anon: false,
-        binary: false,
-        bufsize: 65536,
+    let mut f = Ftp::new(Box::new(io::stdin().lock()), io::stdin().is_terminal());
+    let Some((script, host)) = f.parse_args(env::args().skip(1)) else {
+        print!("{USAGE}");
+        return;
     };
-    let mut script = None;
-    let mut host = Vec::new();
-    for arg in env::args().skip(1) {
-        let Some(opts) = arg.strip_prefix('-') else {
-            host.push(arg);
-            continue;
-        };
-        for (i, c) in opts.char_indices() {
-            match c {
-                'v' => f.verbose = false,
-                'd' => f.debug = true,
-                'i' => f.prompt = false,
-                'n' => f.autologin = false,
-                'g' => f.glob = false,
-                'a' => f.any_iface = true,
-                'A' => f.anon = true,
-                'p' => f.passive = true,
-                's' | 'w' | 'x' | 'r' | 'b' => {
-                    let v = opts[i + 1..].trim_start_matches(':');
-                    match c {
-                        's' => script = Some(v.to_string()),
-                        'w' => f.bufsize = v.parse().unwrap_or(f.bufsize).max(1),
-                        _ => {} // -x/-r/-b socket tuning: the OS auto-tunes better.
-                    }
-                    break;
-                }
-                _ => {
-                    print!("{USAGE}");
-                    return;
-                }
-            }
-        }
-    }
     if let Some(s) = script {
         let Ok(file) = File::open(&s) else {
             println!("Error opening script file {s}.");
@@ -880,21 +909,7 @@ fn main() {
     }
     loop {
         let Some(line) = f.ask("ftp> ", false) else { f.quit() };
-        let line = line.trim();
-        let (name, rest) = match line.strip_prefix('!') {
-            Some(r) => ("!".to_string(), r),
-            None => {
-                let (n, r) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-                (n.to_lowercase(), r.trim())
-            }
-        };
-        if name.is_empty() {
-            continue;
-        }
-        match lookup(&name) {
-            Ok(i) => f.run(CMDS[i].0, rest, split_args(rest)),
-            Err(e) => println!("{e}"),
-        }
+        f.exec(&line);
     }
 }
 
@@ -924,5 +939,15 @@ mod tests {
         assert_eq!(lookup("dir").map(|i| CMDS[i].0), Ok("dir"));
         assert_eq!(lookup("d"), Err("Ambiguous command."));
         assert_eq!(lookup("xyz"), Err("Invalid command."));
+    }
+
+    #[test]
+    fn flags() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut f = Ftp::new(Box::new(io::empty()), false);
+        let (script, host) = f.parse_args(args(&["-inv", "-p", "-s:x y.txt", "-w:10", "-x:1", "host", "21"])).unwrap();
+        assert_eq!((script.as_deref(), host), (Some("x y.txt"), args(&["host", "21"])));
+        assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.bufsize == 10);
+        assert!(Ftp::new(Box::new(io::empty()), false).parse_args(args(&["-?"])).is_none());
     }
 }
