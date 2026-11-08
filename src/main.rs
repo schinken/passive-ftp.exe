@@ -44,7 +44,7 @@ struct CommandInfo {
     help: &'static str,
 }
 
-const CMDS: &[CommandInfo] = &[
+const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "!",
         help: "escape to the shell",
@@ -215,7 +215,7 @@ const CMDS: &[CommandInfo] = &[
     },
 ];
 
-const NEEDS_CONN: &[&str] = &[
+const NEEDS_CONNECTION: &[&str] = &[
     "append",
     "cd",
     "close",
@@ -247,7 +247,7 @@ const HASH_BYTES: u64 = 2048;
 struct Ftp {
     input: Box<dyn BufRead>,
     tty: bool,
-    ctrl: Option<BufReader<TcpStream>>,
+    control: Option<BufReader<TcpStream>>,
     host: String,
     verbose: bool,
     debug: bool,
@@ -257,11 +257,11 @@ struct Ftp {
     bell: bool,
     trace: bool,
     passive: bool,
-    any_iface: bool,
+    any_interface: bool,
     autologin: bool,
-    anon: bool,
+    anonymous: bool,
     binary: bool,
-    bufsize: usize,
+    buffer_size: usize,
     timeout: Duration,
 }
 
@@ -314,23 +314,23 @@ fn stdout_sink() -> Sink<'static> {
 
 enum Data {
     Listen(TcpListener),
-    Conn(TcpStream),
+    Connected(TcpStream),
 }
 
 impl Data {
-    /// Waits at most `t` for the server's data connection; reads and writes then time out after `t`.
-    fn open(self, t: Duration) -> io::Result<TcpStream> {
-        let s = match self {
-            Data::Conn(s) => s,
-            Data::Listen(l) => {
+    /// Waits at most `timeout` for the server's data connection; reads and writes then time out after `timeout`.
+    fn open(self, timeout: Duration) -> io::Result<TcpStream> {
+        let stream = match self {
+            Data::Connected(stream) => stream,
+            Data::Listen(listener) => {
                 // ponytail: polls accept() every 5 ms (std has no accept timeout). WSAPoll would avoid the wakeups.
-                l.set_nonblocking(true)?;
-                let end = Instant::now() + t;
+                listener.set_nonblocking(true)?;
+                let deadline = Instant::now() + timeout;
                 loop {
-                    match l.accept() {
-                        Ok((s, _)) => break s,
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
                         Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
-                        Err(_) if Instant::now() >= end => {
+                        Err(_) if Instant::now() >= deadline => {
                             return Err(io::Error::new(
                                 io::ErrorKind::TimedOut,
                                 "no data connection from server",
@@ -341,10 +341,10 @@ impl Data {
                 }
             }
         };
-        s.set_nonblocking(false)?; // Accepted sockets inherit non-blocking mode on Windows.
-        s.set_read_timeout(Some(t))?;
-        s.set_write_timeout(Some(t))?;
-        Ok(s)
+        stream.set_nonblocking(false)?; // Accepted sockets inherit non-blocking mode on Windows.
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Ok(stream)
     }
 }
 
@@ -353,7 +353,7 @@ impl Ftp {
         Ftp {
             input,
             tty,
-            ctrl: None,
+            control: None,
             host: String::new(),
             verbose: true,
             debug: false,
@@ -363,11 +363,11 @@ impl Ftp {
             bell: false,
             trace: false,
             passive: false,
-            any_iface: false,
+            any_interface: false,
             autologin: true,
-            anon: false,
+            anonymous: false,
             binary: false,
-            bufsize: 65536,
+            buffer_size: 65536,
             timeout: Duration::from_secs(60),
         }
     }
@@ -388,14 +388,14 @@ impl Ftp {
                     'i' => self.prompt = false,
                     'n' => self.autologin = false,
                     'g' => self.glob = false,
-                    'a' => self.any_iface = true,
-                    'A' => self.anon = true,
+                    'a' => self.any_interface = true,
+                    'A' => self.anonymous = true,
                     'p' => self.passive = true,
                     's' | 'w' | 'x' | 'r' | 'b' => {
                         let v = opts[i + 1..].trim_start_matches(':');
                         match c {
                             's' => script = Some(v.to_string()),
-                            'w' => self.bufsize = v.parse().unwrap_or(self.bufsize).max(1),
+                            'w' => self.buffer_size = v.parse().unwrap_or(self.buffer_size).max(1),
                             _ => {} // -x/-r/-b socket tuning: the OS auto-tunes better.
                         }
                         break;
@@ -413,8 +413,8 @@ impl Ftp {
         let (name, rest) = match line.strip_prefix('!') {
             Some(r) => ("!".to_string(), r),
             None => {
-                let (n, r) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-                (n.to_lowercase(), r.trim())
+                let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+                (word.to_lowercase(), rest.trim())
             }
         };
         if name.is_empty() {
@@ -451,7 +451,7 @@ impl Ftp {
         if !matches!(n, Ok(1..)) {
             return None;
         }
-        let line = String::from_utf8(buf).unwrap_or_else(|e| legacy(e.as_bytes()));
+        let line = String::from_utf8(buf).unwrap_or_else(|e| decode_oem(e.as_bytes()));
         let line = line
             .trim_start_matches('\u{feff}')
             .trim_end_matches(['\r', '\n']);
@@ -462,16 +462,22 @@ impl Ftp {
         Some(line.to_string())
     }
 
-    /// Prompts for missing arguments: all prompts if none given, else up to `need`.
-    fn need(&mut self, a: &mut Vec<String>, need: usize, prompts: &[&str]) -> bool {
-        let want = if a.is_empty() { prompts.len() } else { need };
-        while a.len() < want {
-            match self.ask(prompts[a.len()]) {
-                Some(s) if !s.trim().is_empty() => a.push(s.trim().trim_matches('"').to_string()),
+    /// Prompts for missing arguments: all prompts if none given, else up to `required`.
+    fn require_args(&mut self, args: &mut Vec<String>, required: usize, prompts: &[&str]) -> bool {
+        let wanted = if args.is_empty() {
+            prompts.len()
+        } else {
+            required
+        };
+        while args.len() < wanted {
+            match self.ask(prompts[args.len()]) {
+                Some(arg) if !arg.trim().is_empty() => {
+                    args.push(arg.trim().trim_matches('"').to_string())
+                }
                 _ => break,
             }
         }
-        a.len() >= need
+        args.len() >= required
     }
 
     fn confirm(&mut self, what: &str, name: &str) -> Answer {
@@ -488,27 +494,27 @@ impl Ftp {
         }
     }
 
-    fn lost(&mut self, why: &str) {
+    fn drop_connection(&mut self, why: &str) {
         println!("{why}");
-        self.ctrl = None;
+        self.control = None;
     }
 
     fn reply(&mut self) -> Reply {
         let mut text = String::new();
         let mut code = 0;
         loop {
-            let Some(r) = self.ctrl.as_mut() else {
+            let Some(r) = self.control.as_mut() else {
                 return Reply { code: 0, text };
             };
             let mut buf = Vec::new();
             match r.read_until(b'\n', &mut buf) {
                 Ok(1..) => {}
                 Ok(0) => {
-                    self.lost("Connection closed by remote host.");
+                    self.drop_connection("Connection closed by remote host.");
                     return Reply { code: 0, text };
                 }
                 Err(e) => {
-                    self.lost(&format!("> ftp: {e}"));
+                    self.drop_connection(&format!("> ftp: {e}"));
                     return Reply { code: 0, text };
                 }
             }
@@ -536,8 +542,8 @@ impl Ftp {
         }
     }
 
-    fn cmd(&mut self, line: &str) -> Reply {
-        let Some(r) = self.ctrl.as_mut() else {
+    fn command(&mut self, line: &str) -> Reply {
+        let Some(control) = self.control.as_mut() else {
             println!("Not connected.");
             return Reply {
                 code: 0,
@@ -554,11 +560,12 @@ impl Ftp {
                 }
             );
         }
-        if r.get_mut()
+        if control
+            .get_mut()
             .write_all(format!("{line}\r\n").as_bytes())
             .is_err()
         {
-            self.lost("Connection closed by remote host.");
+            self.drop_connection("Connection closed by remote host.");
             return Reply {
                 code: 0,
                 text: String::new(),
@@ -567,20 +574,21 @@ impl Ftp {
         self.reply()
     }
 
-    fn code(&mut self, line: &str) -> u16 {
-        self.cmd(line).code
+    /// Like `command`, for callers that only need the reply code.
+    fn send(&mut self, line: &str) -> u16 {
+        self.command(line).code
     }
 
-    fn open(&mut self, mut a: Vec<String>) {
-        if self.ctrl.is_some() {
+    fn open(&mut self, mut args: Vec<String>) {
+        if self.control.is_some() {
             println!("Already connected to {}, use disconnect first.", self.host);
             return;
         }
-        if !self.need(&mut a, 1, &["To "]) {
+        if !self.require_args(&mut args, 1, &["To "]) {
             return;
         }
-        let port: u16 = a.get(1).and_then(|p| p.parse().ok()).unwrap_or(21);
-        let host = a.swap_remove(0);
+        let port: u16 = args.get(1).and_then(|port| port.parse().ok()).unwrap_or(21);
+        let host = args.swap_remove(0);
         let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
             Ok(it) => it.collect(),
             Err(_) => {
@@ -588,32 +596,32 @@ impl Ftp {
                 return;
             }
         };
-        let s = match TcpStream::connect(&addrs[..]) {
-            Ok(s) => s,
+        let stream = match TcpStream::connect(&addrs[..]) {
+            Ok(stream) => stream,
             Err(e) => {
                 println!("> ftp: connect :{e}");
                 return;
             }
         };
-        s.set_nodelay(true).ok();
-        s.set_read_timeout(Some(self.timeout)).ok();
-        s.set_write_timeout(Some(self.timeout)).ok();
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(self.timeout)).ok();
+        stream.set_write_timeout(Some(self.timeout)).ok();
         println!("Connected to {host}.");
-        self.ctrl = Some(BufReader::new(s));
+        self.control = Some(BufReader::new(stream));
         self.host = host;
         self.binary = false;
         if self.reply().code / 100 != 2 {
-            self.ctrl = None;
+            self.control = None;
             return;
         }
-        self.cmd("OPTS UTF8 ON");
+        self.command("OPTS UTF8 ON");
         if self.autologin {
             self.login(Vec::new());
         }
     }
 
     fn login(&mut self, args: Vec<String>) {
-        let args = if args.is_empty() && self.anon {
+        let args = if args.is_empty() && self.anonymous {
             let me = env::var("USERNAME").unwrap_or_default();
             let host = env::var("COMPUTERNAME").unwrap_or_default();
             vec!["anonymous".into(), format!("{me}@{host}")]
@@ -626,18 +634,18 @@ impl Ftp {
         let Some(user) = user.or_else(|| self.ask(&prompt)) else {
             return;
         };
-        let mut code = self.code(&format!("USER {user}"));
+        let mut code = self.send(&format!("USER {user}"));
         if code == 331 {
             let Some(pass) = pass.or_else(|| self.ask_secret("Password:")) else {
                 return;
             };
-            code = self.code(&format!("PASS {pass}"));
+            code = self.send(&format!("PASS {pass}"));
         }
         if code == 332 {
             let Some(account) = account.or_else(|| self.ask("Account:")) else {
                 return;
             };
-            code = self.code(&format!("ACCT {account}"));
+            code = self.send(&format!("ACCT {account}"));
         }
         if code / 100 != 2 {
             println!("Login failed.");
@@ -645,9 +653,9 @@ impl Ftp {
     }
 
     fn close(&mut self) {
-        if self.ctrl.is_some() {
-            self.code("QUIT");
-            self.ctrl = None;
+        if self.control.is_some() {
+            self.send("QUIT");
+            self.control = None;
         }
     }
 
@@ -657,74 +665,74 @@ impl Ftp {
     }
 
     fn set_binary(&mut self, binary: bool) {
-        if self.code(if binary { "TYPE I" } else { "TYPE A" }) / 100 == 2 {
+        if self.send(if binary { "TYPE I" } else { "TYPE A" }) / 100 == 2 {
             self.binary = binary;
         }
     }
 
     /// Prepares the data connection: PASV/EPSV when passive, PORT/EPRT otherwise.
     fn data(&mut self) -> Option<Data> {
-        let s = self.ctrl.as_ref()?.get_ref();
-        let (local, peer) = (s.local_addr().ok()?, s.peer_addr().ok()?);
+        let control = self.control.as_ref()?.get_ref();
+        let (local, peer) = (control.local_addr().ok()?, control.peer_addr().ok()?);
         if self.passive {
-            let reply = self.cmd(if peer.is_ipv4() { "PASV" } else { "EPSV" });
+            let reply = self.command(if peer.is_ipv4() { "PASV" } else { "EPSV" });
             let port = pasv_port(reply.code, &reply.text)?;
             // The address in a PASV reply is ignored (NAT-safe, like curl): always use the control peer.
             return match TcpStream::connect((peer.ip(), port)) {
-                Ok(d) => Some(Data::Conn(d)),
+                Ok(stream) => Some(Data::Connected(stream)),
                 Err(e) => {
                     println!("> ftp: connect :{e}");
                     None
                 }
             };
         }
-        let bind: IpAddr = match (self.any_iface, local.ip()) {
+        let bind_ip: IpAddr = match (self.any_interface, local.ip()) {
             (false, ip) => ip,
             (true, IpAddr::V4(_)) => Ipv4Addr::UNSPECIFIED.into(),
             (true, IpAddr::V6(_)) => Ipv6Addr::UNSPECIFIED.into(),
         };
-        let l = match TcpListener::bind((bind, 0)) {
-            Ok(l) => l,
+        let listener = match TcpListener::bind((bind_ip, 0)) {
+            Ok(listener) => listener,
             Err(e) => {
                 println!("> ftp: bind :{e}");
                 return None;
             }
         };
-        let p = l.local_addr().ok()?.port();
-        let cmd = match local.ip() {
+        let port = listener.local_addr().ok()?.port();
+        let command = match local.ip() {
             IpAddr::V4(ip) => {
-                let o = ip.octets();
+                let octets = ip.octets();
                 format!(
                     "PORT {},{},{},{},{},{}",
-                    o[0],
-                    o[1],
-                    o[2],
-                    o[3],
-                    p >> 8,
-                    p & 255
+                    octets[0],
+                    octets[1],
+                    octets[2],
+                    octets[3],
+                    port >> 8,
+                    port & 255
                 )
             }
-            IpAddr::V6(ip) => format!("EPRT |2|{ip}|{p}|"),
+            IpAddr::V6(ip) => format!("EPRT |2|{ip}|{port}|"),
         };
-        (self.code(&cmd) / 100 == 2).then_some(Data::Listen(l))
+        (self.send(&command) / 100 == 2).then_some(Data::Listen(listener))
     }
 
-    fn copy(&self, r: &mut dyn Read, w: &mut dyn Write, ascii: bool) -> io::Result<u64> {
-        let mut buf = vec![0u8; self.bufsize];
-        let mut conv = Vec::new();
+    fn copy(&self, reader: &mut dyn Read, writer: &mut dyn Write, ascii: bool) -> io::Result<u64> {
+        let mut buf = vec![0u8; self.buffer_size];
+        let mut converted = Vec::new();
         let (mut total, mut marks, mut cr) = (0u64, 0u64, false);
         loop {
-            let n = match r.read(&mut buf) {
+            let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
             if ascii {
-                to_crlf(&buf[..n], &mut cr, &mut conv);
-                w.write_all(&conv)?;
+                to_crlf(&buf[..n], &mut cr, &mut converted);
+                writer.write_all(&converted)?;
             } else {
-                w.write_all(&buf[..n])?;
+                writer.write_all(&buf[..n])?;
             }
             total += n as u64;
             if self.hash && total / HASH_BYTES > marks {
@@ -733,60 +741,62 @@ impl Ftp {
                 marks = total / HASH_BYTES;
             }
         }
-        w.flush()?;
+        writer.flush()?;
         if marks > 0 {
             println!();
         }
         Ok(total)
     }
 
-    fn finish(&mut self, res: io::Result<u64>, start: Instant, dir: &str) -> bool {
+    fn finish(&mut self, result: io::Result<u64>, start: Instant, direction: &str) -> bool {
         let secs = start.elapsed().as_secs_f64();
-        if let Err(e) = &res {
+        if let Err(e) = &result {
             println!("> ftp: {e}");
         }
         let ok = self.reply().code / 100 == 2;
-        if let Ok(n) = res
+        if let Ok(n) = result
             && ok
             && n > 0
             && self.verbose
         {
-            let kbs = n as f64 / 1000.0 / secs.max(0.001);
-            println!("ftp: {n} bytes {dir} in {secs:.2}Seconds {kbs:.2}Kbytes/sec.");
+            let kbytes_per_sec = n as f64 / 1000.0 / secs.max(0.001);
+            println!(
+                "ftp: {n} bytes {direction} in {secs:.2}Seconds {kbytes_per_sec:.2}Kbytes/sec."
+            );
         }
         if self.bell {
             print!("\x07");
         }
-        ok && res.is_ok()
+        ok && result.is_ok()
     }
 
     /// Runs a download command. `open` creates the output only after the server accepted
     /// the command, so a failed RETR never truncates an existing local file.
-    fn recv<'a>(&mut self, cmd: &str, open: impl FnOnce() -> io::Result<Sink<'a>>) -> bool {
+    fn receive<'a>(&mut self, command: &str, open: impl FnOnce() -> io::Result<Sink<'a>>) -> bool {
         let Some(data) = self.data() else {
             return false;
         };
-        if self.code(cmd) / 100 != 1 {
+        if self.send(command) / 100 != 1 {
             return false;
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data
+        let result = data
             .open(self.timeout)
             .and_then(|mut s| open().and_then(|mut out| self.copy(&mut s, &mut *out, ascii)));
-        self.finish(res, start, "received")
+        self.finish(result, start, "received")
     }
 
-    fn get(&mut self, cmd: String, local: &str) {
+    fn get(&mut self, command: String, local: &str) {
         if local == "-" {
-            self.recv(&cmd, || Ok(stdout_sink()));
+            self.receive(&command, || Ok(stdout_sink()));
             return;
         }
-        let cap = self.bufsize;
-        self.recv(&cmd, || {
+        let capacity = self.buffer_size;
+        self.receive(&command, || {
             let f = File::create(local)
                 .inspect_err(|_| println!("Error opening local file {local}."))?;
-            Ok(Box::new(BufWriter::with_capacity(cap, f)))
+            Ok(Box::new(BufWriter::with_capacity(capacity, f)))
         });
     }
 
@@ -796,59 +806,63 @@ impl Ftp {
             return;
         };
         let Some(data) = self.data() else { return };
-        if self.code(&format!("{verb} {remote}")) / 100 != 1 {
+        if self.send(&format!("{verb} {remote}")) / 100 != 1 {
             return;
         }
         let start = Instant::now();
         let ascii = !self.binary;
-        let res = data
+        let result = data
             .open(self.timeout)
             .and_then(|mut s| self.copy(&mut f, &mut s, ascii));
-        self.finish(res, start, "sent");
+        self.finish(result, start, "sent");
     }
 
-    fn remote_glob(&mut self, pat: &str) -> Vec<String> {
+    fn remote_glob(&mut self, pattern: &str) -> Vec<String> {
         if !self.glob {
-            return vec![pat.into()];
+            return vec![pattern.into()];
         }
-        let mut buf = Vec::new();
-        let v = std::mem::replace(&mut self.verbose, false);
-        self.recv(&format!("NLST {pat}"), || Ok(Box::new(&mut buf)));
-        self.verbose = v;
-        String::from_utf8_lossy(&buf)
+        let mut listing = Vec::new();
+        let was_verbose = std::mem::replace(&mut self.verbose, false);
+        self.receive(&format!("NLST {pattern}"), || Ok(Box::new(&mut listing)));
+        self.verbose = was_verbose;
+        String::from_utf8_lossy(&listing)
             .lines()
-            .filter(|l| !l.is_empty())
+            .filter(|line| !line.is_empty())
             .map(String::from)
             .collect()
     }
 
-    fn local_glob(&self, pat: &str) -> Vec<String> {
-        if !self.glob || !pat.contains(['*', '?']) {
-            return vec![pat.into()];
+    fn local_glob(&self, pattern: &str) -> Vec<String> {
+        if !self.glob || !pattern.contains(['*', '?']) {
+            return vec![pattern.into()];
         }
-        let p = Path::new(pat);
-        let dir = p
+        let path = Path::new(pattern);
+        let dir = path
             .parent()
-            .filter(|d| !d.as_os_str().is_empty())
+            .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let Some(fpat) = p.file_name().and_then(|f| f.to_str()) else {
+        let Some(file_pattern) = path.file_name().and_then(|name| name.to_str()) else {
             return vec![];
         };
-        let mut v: Vec<String> = fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| wild(fpat.as_bytes(), n.as_bytes()))
-            .map(|n| p.with_file_name(n).to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
+        let Ok(entries) = fs::read_dir(dir) else {
+            return vec![];
+        };
+        let mut matches = Vec::new();
+        for entry in entries.flatten() {
+            let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+            if let Ok(name) = entry.file_name().into_string()
+                && is_file
+                && wildcard_match(file_pattern.as_bytes(), name.as_bytes())
+            {
+                matches.push(path.with_file_name(name).to_string_lossy().into_owned());
+            }
+        }
+        matches.sort();
+        matches
     }
 
     fn status(&self) {
-        if self.ctrl.is_some() {
+        if self.control.is_some() {
             println!("Connected to {}.", self.host);
         } else {
             println!("Not connected.");
@@ -856,31 +870,31 @@ impl Ftp {
         println!(
             "Type: {}; Verbose: {} ; Bell: {} ; Prompting: {} ; Globbing: {}",
             if self.binary { "binary" } else { "ascii" },
-            on(self.verbose),
-            on(self.bell),
-            on(self.prompt),
-            on(self.glob)
+            on_off(self.verbose),
+            on_off(self.bell),
+            on_off(self.prompt),
+            on_off(self.glob)
         );
         println!(
             "Debugging: {} ; Hash mark printing: {} ; Passive: {} .",
-            on(self.debug),
-            on(self.hash),
-            on(self.passive)
+            on_off(self.debug),
+            on_off(self.hash),
+            on_off(self.passive)
         );
     }
 
-    fn run(&mut self, name: &str, rest: &str, mut a: Vec<String>) {
-        if NEEDS_CONN.contains(&name) && self.ctrl.is_none() {
+    fn run(&mut self, name: &str, rest: &str, mut args: Vec<String>) {
+        if NEEDS_CONNECTION.contains(&name) && self.control.is_none() {
             println!("Not connected.");
             return;
         }
         match name {
             "!" => shell(rest),
-            "?" | "help" => help(a.first().map(String::as_str)),
+            "?" | "help" => help(args.first().map(String::as_str)),
             "append" | "put" | "send" => {
-                if self.need(&mut a, 1, &["Local file ", "Remote file "]) {
+                if self.require_args(&mut args, 1, &["Local file ", "Remote file "]) {
                     let verb = if name == "append" { "APPE" } else { "STOR" };
-                    self.put(verb, &a[0], a.get(1).unwrap_or(&a[0]));
+                    self.put(verb, &args[0], args.get(1).unwrap_or(&args[0]));
                 }
             }
             "ascii" => self.set_binary(false),
@@ -888,25 +902,27 @@ impl Ftp {
             "bell" => toggle(&mut self.bell, "Bell mode"),
             "bye" | "quit" => self.quit(),
             "cd" => {
-                if self.need(&mut a, 1, &["Remote directory "]) {
-                    self.code(&format!("CWD {}", a[0]));
+                if self.require_args(&mut args, 1, &["Remote directory "]) {
+                    self.send(&format!("CWD {}", args[0]));
                 }
             }
             "close" | "disconnect" => self.close(),
             "debug" => toggle(&mut self.debug, "Debugging"),
             "delete" => {
-                if self.need(&mut a, 1, &["Remote file "]) {
-                    self.code(&format!("DELE {}", a[0]));
+                if self.require_args(&mut args, 1, &["Remote file "]) {
+                    self.send(&format!("DELE {}", args[0]));
                 }
             }
             "dir" | "ls" => {
                 let verb = if name == "dir" { "LIST" } else { "NLST" };
-                let cmd = a.first().map_or(verb.into(), |d| format!("{verb} {d}"));
-                self.get(cmd, a.get(1).map_or("-", |s| s));
+                let command = args
+                    .first()
+                    .map_or(verb.into(), |dir| format!("{verb} {dir}"));
+                self.get(command, args.get(1).map_or("-", |s| s));
             }
             "get" | "recv" => {
-                if self.need(&mut a, 1, &["Remote file ", "Local file "]) {
-                    self.get(format!("RETR {}", a[0]), a.get(1).unwrap_or(&a[0]));
+                if self.require_args(&mut args, 1, &["Remote file ", "Local file "]) {
+                    self.get(format!("RETR {}", args[0]), args.get(1).unwrap_or(&args[0]));
                 }
             }
             "glob" => toggle(&mut self.glob, "Globbing"),
@@ -919,10 +935,10 @@ impl Ftp {
                 }
             }
             "lcd" => {
-                if let Some(d) = a.first()
-                    && let Err(e) = env::set_current_dir(d)
+                if let Some(dir) = args.first()
+                    && let Err(e) = env::set_current_dir(dir)
                 {
-                    println!("{d}: {e}");
+                    println!("{dir}: {e}");
                     return;
                 }
                 let cwd = env::current_dir().unwrap_or_default();
@@ -935,28 +951,30 @@ impl Ftp {
                     Some(rest.into())
                 };
                 if let Some(line) = line.filter(|l| !l.trim().is_empty()) {
-                    let mut code = self.code(&line);
+                    let mut code = self.send(&line);
                     while code / 100 == 1 {
                         code = self.reply().code;
                     }
                 }
             }
             "mdelete" | "mget" => {
-                if !self.need(&mut a, 1, &["Remote files "]) {
+                if !self.require_args(&mut args, 1, &["Remote files "]) {
                     return;
                 }
-                for pat in &a {
-                    for f in self.remote_glob(pat) {
-                        match self.confirm(name, &f) {
+                for pattern in &args {
+                    for file in self.remote_glob(pattern) {
+                        match self.confirm(name, &file) {
                             Answer::Yes if name == "mget" => {
                                 // Names come from the server: keep only the file name so a
                                 // listing like `../x` or `C:\x` can't write outside the cwd.
-                                if let Some(n) = Path::new(&f).file_name().and_then(|n| n.to_str())
+                                if let Some(local) = Path::new(&file)
+                                    .file_name()
+                                    .and_then(|local| local.to_str())
                                 {
-                                    self.get(format!("RETR {f}"), n);
+                                    self.get(format!("RETR {file}"), local);
                                 }
                             }
-                            Answer::Yes => _ = self.code(&format!("DELE {f}")),
+                            Answer::Yes => _ = self.send(&format!("DELE {file}")),
                             Answer::No => {}
                             Answer::Quit => return,
                         }
@@ -964,10 +982,10 @@ impl Ftp {
                 }
             }
             "mdir" | "mls" => {
-                if !self.need(&mut a, 2, &["Remote files ", "Local file "]) {
+                if !self.require_args(&mut args, 2, &["Remote files ", "Local file "]) {
                     return;
                 }
-                let local = a.pop().unwrap_or_default();
+                let local = args.pop().unwrap_or_default();
                 if local != "-"
                     && !matches!(self.confirm("output to local-file:", &local), Answer::Yes)
                 {
@@ -985,67 +1003,67 @@ impl Ftp {
                     }
                 };
                 let verb = if name == "mdir" { "LIST" } else { "NLST" };
-                for r in &a {
-                    self.recv(&format!("{verb} {r}"), || Ok(Box::new(&mut out)));
+                for remote in &args {
+                    self.receive(&format!("{verb} {remote}"), || Ok(Box::new(&mut out)));
                 }
             }
             "mkdir" => {
-                if self.need(&mut a, 1, &["Directory name "]) {
-                    self.code(&format!("XMKD {}", a[0]));
+                if self.require_args(&mut args, 1, &["Directory name "]) {
+                    self.send(&format!("XMKD {}", args[0]));
                 }
             }
             "mput" => {
-                if !self.need(&mut a, 1, &["Local files "]) {
+                if !self.require_args(&mut args, 1, &["Local files "]) {
                     return;
                 }
-                for pat in &a {
-                    for f in self.local_glob(pat) {
-                        match self.confirm(name, &f) {
-                            Answer::Yes => self.put("STOR", &f, &f),
+                for pattern in &args {
+                    for file in self.local_glob(pattern) {
+                        match self.confirm(name, &file) {
+                            Answer::Yes => self.put("STOR", &file, &file),
                             Answer::No => {}
                             Answer::Quit => return,
                         }
                     }
                 }
             }
-            "open" => self.open(a),
+            "open" => self.open(args),
             "prompt" => toggle(&mut self.prompt, "Interactive mode"),
             "pwd" | "remotehelp" => {
-                let cmd = match (name, a.first()) {
+                let command = match (name, args.first()) {
                     ("pwd", _) => "XPWD".to_string(),
-                    (_, Some(c)) => format!("HELP {c}"),
+                    (_, Some(topic)) => format!("HELP {topic}"),
                     _ => "HELP".to_string(),
                 };
-                let v = std::mem::replace(&mut self.verbose, true);
-                self.code(&cmd);
-                self.verbose = v;
+                let was_verbose = std::mem::replace(&mut self.verbose, true);
+                self.send(&command);
+                self.verbose = was_verbose;
             }
             "rename" => {
-                if self.need(&mut a, 2, &["From name ", "To name "])
-                    && self.code(&format!("RNFR {}", a[0])) == 350
+                if self.require_args(&mut args, 2, &["From name ", "To name "])
+                    && self.send(&format!("RNFR {}", args[0])) == 350
                 {
-                    self.code(&format!("RNTO {}", a[1]));
+                    self.send(&format!("RNTO {}", args[1]));
                 }
             }
             "rmdir" => {
-                if self.need(&mut a, 1, &["Directory name "]) {
-                    self.code(&format!("XRMD {}", a[0]));
+                if self.require_args(&mut args, 1, &["Directory name "]) {
+                    self.send(&format!("XRMD {}", args[0]));
                 }
             }
             "status" => self.status(),
             "trace" => toggle(&mut self.trace, "Packet tracing"),
-            "type" => match a.first().map(|s| s.to_lowercase()).as_deref() {
+            "type" => match args.first().map(|s| s.to_lowercase()).as_deref() {
                 None => println!(
                     "Using {} mode to transfer files.",
                     if self.binary { "binary" } else { "ascii" }
                 ),
                 Some("ascii") => self.set_binary(false),
                 Some("binary" | "image") => self.set_binary(true),
-                Some(m) => println!("{m}: unknown mode."),
+                Some(mode) => println!("{mode}: unknown mode."),
             },
             "user" => {
-                if self.need(&mut a, 1, &["Username "]) {
-                    self.login(a);
+                if self.require_args(&mut args, 1, &["Username "]) {
+                    self.login(args);
                 }
             }
             "verbose" => toggle(&mut self.verbose, "Verbose mode"),
@@ -1054,13 +1072,13 @@ impl Ftp {
     }
 }
 
-fn on(b: bool) -> &'static str {
+fn on_off(b: bool) -> &'static str {
     if b { "On" } else { "Off" }
 }
 
 fn toggle(flag: &mut bool, what: &str) {
     *flag = !*flag;
-    println!("{what} {} .", on(*flag));
+    println!("{what} {} .", on_off(*flag));
 }
 
 /// Code and "more lines follow" flag if `line` starts a reply (`123 text` / `123-text`).
@@ -1081,14 +1099,14 @@ fn reply_start(line: &str) -> Option<(u16, bool)> {
 fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
         227 => {
-            let t = text.get(3..)?;
-            let t = t.find('(').map_or(t, |i| &t[i..]); // Skip digits in the text before "(".
-            let n: Vec<u16> = t
+            let rest = text.get(3..)?;
+            let rest = rest.find('(').map_or(rest, |i| &rest[i..]); // Skip digits in the text before "(".
+            let numbers: Vec<u16> = rest
                 .split(|c: char| !c.is_ascii_digit())
-                .filter_map(|x| x.parse().ok())
+                .filter_map(|digits| digits.parse().ok())
                 .take(6)
                 .collect();
-            Some(n.get(4)? << 8 | n.get(5)?)
+            Some(numbers.get(4)? << 8 | numbers.get(5)?)
         }
         229 => text.split('|').nth(3)?.parse().ok(),
         _ => None,
@@ -1109,42 +1127,47 @@ fn to_crlf(chunk: &[u8], cr: &mut bool, out: &mut Vec<u8>) {
 
 /// Case-insensitive `*` / `?` match, as on Windows.
 // ponytail: backtracking matcher, exponential on patterns with many `*`; fine for file names.
-fn wild(p: &[u8], s: &[u8]) -> bool {
-    match (p.first(), s.first()) {
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    match (pattern.first(), text.first()) {
         (None, None) => true,
-        (Some(b'*'), _) => wild(&p[1..], s) || (!s.is_empty() && wild(p, &s[1..])),
-        (Some(b'?'), Some(_)) => wild(&p[1..], &s[1..]),
-        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && wild(&p[1..], &s[1..]),
+        (Some(b'*'), _) => {
+            wildcard_match(&pattern[1..], text)
+                || (!text.is_empty() && wildcard_match(pattern, &text[1..]))
+        }
+        (Some(b'?'), Some(_)) => wildcard_match(&pattern[1..], &text[1..]),
+        (Some(a), Some(b)) => {
+            a.eq_ignore_ascii_case(b) && wildcard_match(&pattern[1..], &text[1..])
+        }
         _ => false,
     }
 }
 
 /// Splits on whitespace; double quotes group words (`put "my file.txt"`).
-fn split_args(s: &str) -> Vec<String> {
-    let (mut v, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
-    for c in s.chars() {
+fn split_args(line: &str) -> Vec<String> {
+    let (mut args, mut current, mut quoted, mut in_arg) = (Vec::new(), String::new(), false, false);
+    for c in line.chars() {
         match c {
-            '"' => (quoted, any) = (!quoted, true),
+            '"' => (quoted, in_arg) = (!quoted, true),
             c if c.is_whitespace() && !quoted => {
-                if any {
-                    v.push(std::mem::take(&mut cur));
-                    any = false;
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
                 }
             }
-            c => (cur.push(c), any = true).1,
+            c => (current.push(c), in_arg = true).1,
         }
     }
-    if any {
-        v.push(cur);
+    if in_arg {
+        args.push(current);
     }
-    v
+    args
 }
 
 fn lookup(name: &str) -> Result<&'static CommandInfo, &'static str> {
-    if let Some(c) = CMDS.iter().find(|c| c.name == name) {
+    if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
         return Ok(c);
     }
-    let mut hits = CMDS.iter().filter(|c| c.name.starts_with(name));
+    let mut hits = COMMANDS.iter().filter(|c| c.name.starts_with(name));
     match (hits.next(), hits.next()) {
         (Some(c), None) => Ok(c),
         (Some(_), Some(_)) => Err("Ambiguous command."),
@@ -1153,19 +1176,19 @@ fn lookup(name: &str) -> Result<&'static CommandInfo, &'static str> {
 }
 
 fn help(arg: Option<&str>) {
-    if let Some(c) = arg {
-        match lookup(&c.to_lowercase()) {
+    if let Some(name) = arg {
+        match lookup(&name.to_lowercase()) {
             Ok(c) => println!("{:<16}{}", c.name, c.help),
-            Err(_) => println!("Invalid help command {c}."),
+            Err(_) => println!("Invalid help command {name}."),
         }
         return;
     }
     println!("Commands may be abbreviated.  Commands are:\n");
-    let rows = CMDS.len().div_ceil(5);
-    for r in 0..rows {
-        let line: String = CMDS
+    let rows = COMMANDS.len().div_ceil(5);
+    for row in 0..rows {
+        let line: String = COMMANDS
             .iter()
-            .skip(r)
+            .skip(row)
             .step_by(rows)
             .map(|c| format!("{:<16}", c.name))
             .collect();
@@ -1176,19 +1199,19 @@ fn help(arg: Option<&str>) {
 fn shell(line: &str) {
     let line = line.trim();
     #[cfg(windows)]
-    let mut c = Command::new(env::var("COMSPEC").unwrap_or("cmd.exe".into()));
+    let mut command = Command::new(env::var("COMSPEC").unwrap_or("cmd.exe".into()));
     #[cfg(windows)]
     if !line.is_empty() {
         use std::os::windows::process::CommandExt;
-        c.raw_arg(format!("/C {line}"));
+        command.raw_arg(format!("/C {line}"));
     }
     #[cfg(not(windows))]
-    let mut c = Command::new("sh");
+    let mut command = Command::new("sh");
     #[cfg(not(windows))]
     if !line.is_empty() {
-        c.args(["-c", line]);
+        command.args(["-c", line]);
     }
-    c.status().ok();
+    command.status().ok();
 }
 
 #[cfg(windows)]
@@ -1196,18 +1219,18 @@ fn set_console_echo(on: bool) {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetStdHandle(id: u32) -> isize;
-        fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
-        fn SetConsoleMode(h: isize, mode: u32) -> i32;
+        fn GetConsoleMode(handle: isize, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: isize, mode: u32) -> i32;
     }
     const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const ENABLE_ECHO_INPUT: u32 = 4;
     // SAFETY: plain Win32 calls with a handle we just got and a valid pointer to a local u32.
     unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode = 0;
-        if GetConsoleMode(h, &mut mode) != 0 {
+        if GetConsoleMode(handle, &mut mode) != 0 {
             SetConsoleMode(
-                h,
+                handle,
                 if on {
                     mode | ENABLE_ECHO_INPUT
                 } else {
@@ -1224,63 +1247,65 @@ fn set_console_echo(_on: bool) {}
 /// Decodes a non-UTF-8 script line with the OEM code page,
 /// which is what `echo ... >> script.txt` in cmd.exe writes.
 #[cfg(windows)]
-fn legacy(b: &[u8]) -> String {
+fn decode_oem(bytes: &[u8]) -> String {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MultiByteToWideChar(
             cp: u32,
             flags: u32,
             s: *const u8,
-            n: i32,
+            len: i32,
             w: *mut u16,
             wn: i32,
         ) -> i32;
     }
     const CP_OEMCP: u32 = 1;
-    let mut w = vec![0u16; b.len()];
+    let mut wide = vec![0u16; bytes.len()];
     // SAFETY: both pointers are valid for the lengths passed, and a code page never yields
     // more UTF-16 units than input bytes, so `w` is large enough.
-    let n = unsafe {
+    let len = unsafe {
         MultiByteToWideChar(
             CP_OEMCP,
             0,
-            b.as_ptr(),
-            b.len() as i32,
-            w.as_mut_ptr(),
-            w.len() as i32,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
         )
     };
-    if n <= 0 {
-        return String::from_utf8_lossy(b).into_owned();
+    if len <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
-    String::from_utf16_lossy(&w[..n as usize])
+    String::from_utf16_lossy(&wide[..len as usize])
 }
 
 #[cfg(not(windows))]
-fn legacy(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
+fn decode_oem(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn main() {
-    let mut f = Ftp::new(Box::new(io::stdin().lock()), io::stdin().is_terminal());
-    let Some(CommandLine { script, host }) = f.parse_args(env::args().skip(1)) else {
+    let mut ftp = Ftp::new(Box::new(io::stdin().lock()), io::stdin().is_terminal());
+    let Some(CommandLine { script, host }) = ftp.parse_args(env::args().skip(1)) else {
         print!("{USAGE}");
         return;
     };
-    if let Some(s) = script {
-        let Ok(file) = File::open(&s) else {
-            println!("Error opening script file {s}.");
+    if let Some(path) = script {
+        let Ok(file) = File::open(&path) else {
+            println!("Error opening script file {path}.");
             return;
         };
-        f.input = Box::new(BufReader::new(file));
-        f.tty = false;
+        ftp.input = Box::new(BufReader::new(file));
+        ftp.tty = false;
     }
     if !host.is_empty() {
-        f.open(host);
+        ftp.open(host);
     }
     loop {
-        let Some(line) = f.ask("ftp> ") else { f.quit() };
-        f.exec(&line);
+        let Some(line) = ftp.ask("ftp> ") else {
+            ftp.quit()
+        };
+        ftp.exec(&line);
     }
 }
 
@@ -1309,7 +1334,9 @@ mod tests {
         assert_eq!(out, b"\nc\r\n");
 
         assert!(
-            wild(b"*.TXT", b"a.txt") && wild(b"f?o*", b"foo.bar") && !wild(b"*.txt", b"a.txt.bak")
+            wildcard_match(b"*.TXT", b"a.txt")
+                && wildcard_match(b"f?o*", b"foo.bar")
+                && !wildcard_match(b"*.txt", b"a.txt.bak")
         );
 
         assert_eq!(
@@ -1358,7 +1385,7 @@ mod tests {
             (script.as_deref(), host),
             (Some("x y.txt"), args(&["host", "21"]))
         );
-        assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.bufsize == 10);
+        assert!(!f.prompt && !f.autologin && !f.verbose && f.passive && f.buffer_size == 10);
         assert!(
             Ftp::new(Box::new(io::empty()), false)
                 .parse_args(args(&["-?"]))
@@ -1371,7 +1398,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let mut f = Ftp::new(Box::new(io::Cursor::new(input.to_string())), false);
-        f.ctrl = Some(BufReader::new(c));
+        f.control = Some(BufReader::new(c));
         (f, l.accept().unwrap().0)
     }
 
@@ -1387,8 +1414,8 @@ mod tests {
                     return;
                 }
                 let line = line.trim_end();
-                let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
-                let reply = match cmd {
+                let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
+                let reply = match command {
                     "PASV" => {
                         let l = TcpListener::bind("127.0.0.1:0").unwrap();
                         let p = l.local_addr().unwrap().port();
