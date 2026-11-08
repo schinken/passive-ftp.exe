@@ -359,7 +359,7 @@ impl Ftp {
                 }
                 (c, _) => line.starts_with(&format!("{c} ")) || line == c.to_string(),
             };
-            if self.verbose || code >= 500 {
+            if self.verbose || code >= 400 {
                 println!("{line}");
             }
             if code == 0 {
@@ -584,6 +584,7 @@ impl Ftp {
         }
         let ok = self.reply().0 / 100 == 2;
         if let Ok(n) = res
+            && ok
             && n > 0
             && self.verbose
         {
@@ -915,7 +916,9 @@ fn reply_start(line: &str) -> Option<(u16, bool)> {
 fn pasv_port(code: u16, text: &str) -> Option<u16> {
     match code {
         227 => {
-            let n: Vec<u16> = text[3..]
+            let t = text.get(3..)?;
+            let t = t.find('(').map_or(t, |i| &t[i..]); // skip digits in the text before "("
+            let n: Vec<u16> = t
                 .split(|c: char| !c.is_ascii_digit())
                 .filter_map(|x| x.parse().ok())
                 .take(6)
@@ -1127,6 +1130,7 @@ mod tests {
             Some(195 * 256 + 80)
         );
         assert_eq!(pasv_port(227, "227 =10,0,0,1,4,1"), Some(1025));
+        assert_eq!(pasv_port(227, "227 Passive v2 (10,0,0,1,4,1)"), Some(1025));
         assert_eq!(
             pasv_port(229, "229 Entering Extended Passive Mode (|||6446|)"),
             Some(6446)
