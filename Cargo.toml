@@ -1,6 +1,6 @@
 [package]
 name = "ftp"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Drop-in replacement for Windows ftp.exe with passive mode support"
 license = "MIT"
